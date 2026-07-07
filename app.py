@@ -193,8 +193,7 @@ class DartClient:
         files = self.get_document_texts(report.receipt_no)
         rows: list[BorrowingLine] = []
         for source_file, text in files:
-            for line_no, raw_line in enumerate(text.splitlines(), start=1):
-                context = clean_context(raw_line)
+            for line_no, context in extract_text_records(text):
                 if not context:
                     continue
                 keyword = next((k for k in BORROWING_KEYWORDS if k in context), "")
@@ -326,6 +325,28 @@ def normalize_text(value: str) -> str:
 def clean_context(value: str) -> str:
     value = re.sub(r"<[^>]+>", " ", value)
     return normalize_text(value)
+
+
+def extract_text_records(text: str) -> list[tuple[int, str]]:
+    records: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(r"<TR\b.*?</TR>", text, flags=re.IGNORECASE | re.DOTALL):
+        context = clean_context(match.group(0))
+        if context and context not in seen:
+            line_no = text.count("\n", 0, match.start()) + 1
+            records.append((line_no, context))
+            seen.add(context)
+
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        if "<TD" in raw_line.upper() or "<TR" in raw_line.upper() or "</TD" in raw_line.upper():
+            continue
+        context = clean_context(raw_line)
+        if context and context not in seen:
+            records.append((line_no, context))
+            seen.add(context)
+
+    return sorted(records, key=lambda item: item[0])
 
 
 def extract_snippets(plain: str) -> list[str]:
