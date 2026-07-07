@@ -427,6 +427,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         by_receipt.setdefault(line.receipt_no, []).append(line)
 
     rows: list[dict] = []
+    prev_amount_sum: int | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
         report_lines = by_receipt.get(report.receipt_no, [])
         borrowing_rate_lines = [line for line in report_lines if not is_wacc_context(line.context)]
@@ -435,6 +436,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         amount_sum = sum(line.max_amount for line in report_lines)
         max_amount = max((line.max_amount for line in report_lines), default=0)
+        amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
+        amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
@@ -468,6 +471,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
+                "amount_diff": amount_diff,
+                "amount_change": amount_change,
                 "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
@@ -478,6 +483,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "result": result,
             }
         )
+        prev_amount_sum = amount_sum
 
     return rows
 
@@ -583,6 +589,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "검출금액합계",
                 "최대라인금액",
                 "금액단위",
+                "전기대비증감",
+                "전기대비변동률",
                 "최저차입이자율",
                 "평균차입이자율",
                 "최고차입이자율",
@@ -603,6 +611,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["amount_sum"],
                     t["max_amount"],
                     t["amount_unit"],
+                    t["amount_diff"],
+                    t["amount_change"],
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
@@ -613,7 +623,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 11: 3, 12: 3, 13: 3, 14: 3, 15: 3, 16: 3},
+            {5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 11: 2, 12: 3, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3},
         ),
     ]
 
@@ -630,7 +640,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
 def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 14, 14, 16, 34, 18]
+    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 16, 16, 14, 14, 16, 34]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
