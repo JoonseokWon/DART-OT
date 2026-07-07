@@ -63,6 +63,7 @@ class BorrowingLine:
     keyword: str
     interest_rates: list[float]
     amounts: list[int]
+    amount_unit: str
     max_amount: int
     source_file: str
     line_no: int
@@ -193,7 +194,7 @@ class DartClient:
         files = self.get_document_texts(report.receipt_no)
         rows: list[BorrowingLine] = []
         for source_file, text in files:
-            for line_no, context in extract_text_records(text):
+            for line_no, context, amount_unit in extract_text_records(text):
                 if not context:
                     continue
                 keyword = next((k for k in BORROWING_KEYWORDS if k in context), "")
@@ -210,6 +211,7 @@ class DartClient:
                         keyword,
                         rates,
                         amounts,
+                        amount_unit,
                         max((abs(a) for a in amounts), default=0),
                         Path(source_file).name or f"{report.receipt_no}.xml",
                         line_no,
@@ -327,26 +329,47 @@ def clean_context(value: str) -> str:
     return normalize_text(value)
 
 
-def extract_text_records(text: str) -> list[tuple[int, str]]:
-    records: list[tuple[int, str]] = []
+def extract_text_records(text: str) -> list[tuple[int, str, str]]:
+    raw_records: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
     for match in re.finditer(r"<TR\b.*?</TR>", text, flags=re.IGNORECASE | re.DOTALL):
         context = clean_context(match.group(0))
         if context and context not in seen:
             line_no = text.count("\n", 0, match.start()) + 1
-            records.append((line_no, context))
+            raw_records.append((match.start(), line_no, context))
             seen.add(context)
 
+    offset = 0
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line_start = offset
+        offset += len(raw_line) + 1
         if "<TD" in raw_line.upper() or "<TR" in raw_line.upper() or "</TD" in raw_line.upper():
             continue
         context = clean_context(raw_line)
         if context and context not in seen:
-            records.append((line_no, context))
+            raw_records.append((line_start, line_no, context))
             seen.add(context)
 
-    return sorted(records, key=lambda item: item[0])
+    records: list[tuple[int, str, str]] = []
+    current_unit = ""
+    for _, line_no, context in sorted(raw_records, key=lambda item: item[0]):
+        detected_unit = detect_amount_unit(context)
+        if detected_unit:
+            current_unit = detected_unit
+        records.append((line_no, context, current_unit))
+    return records
+
+
+def detect_amount_unit(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    match = re.search(r"단위[:：]?(백만원|천원|억원|원|USD|천USD|백만USD|미화천달러|미화백만달러)", compact, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    for unit in ("백만원", "천원", "억원"):
+        if unit in text:
+            return unit
+    return ""
 
 
 def extract_snippets(plain: str) -> list[str]:
@@ -414,6 +437,12 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
+        amount_units = sorted({line.amount_unit for line in report_lines if line.max_amount and line.amount_unit})
+        amount_unit = ""
+        if len(amount_units) == 1:
+            amount_unit = amount_units[0]
+        elif len(amount_units) > 1:
+            amount_unit = "혼합: " + ", ".join(amount_units)
 
         rate_change = None
         if avg_rate is not None and prev_avg_rate not in (None, 0):
@@ -441,6 +470,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "rate_count": len(rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
+                "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
                 "max_rate": max_rate,
@@ -517,10 +547,11 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
             "정기보고서목록",
             ["회사명", "보고서명", "접수일", "접수번호", "종목코드"],
             [[r.corp_name, r.report_name, r.receipt_date, r.receipt_no, r.stock_code] for r in reports],
+            {},
         ),
         (
             "차입금필터링",
-            ["회사명", "보고서명", "접수일", "접수번호", "키워드", "이자율", "금액후보", "최대금액", "원문파일", "줄번호", "문맥"],
+            ["회사명", "보고서명", "접수일", "접수번호", "키워드", "이자율", "금액후보", "금액단위", "최대금액", "원문파일", "줄번호", "문맥"],
             [
                 [
                     line.corp_name,
@@ -530,6 +561,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     line.keyword,
                     format_rates(line.interest_rates),
                     ", ".join(str(amount) for amount in line.amounts),
+                    line.amount_unit,
                     line.max_amount,
                     line.source_file,
                     line.line_no,
@@ -537,6 +569,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for line in lines
             ],
+            {9: 2, 11: 2},
         ),
         (
             "이자율오버롤테스트",
@@ -549,6 +582,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "이자율검출수",
                 "검출금액합계",
                 "최대라인금액",
+                "금액단위",
                 "최저이자율",
                 "평균이자율",
                 "최고이자율",
@@ -567,6 +601,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["rate_count"],
                     t["amount_sum"],
                     t["max_amount"],
+                    t["amount_unit"],
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
@@ -577,6 +612,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
+            {5: 2, 6: 2, 7: 2, 8: 2, 10: 3, 11: 3, 12: 3, 13: 3, 14: 2, 15: 3},
         ),
     ]
 
@@ -586,30 +622,32 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
         archive.writestr("xl/workbook.xml", workbook_xml([s[0] for s in sheets]))
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels(len(sheets)))
         archive.writestr("xl/styles.xml", styles_xml())
-        for index, (_, headers, rows) in enumerate(sheets, start=1):
-            archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(headers, rows))
+        for index, (_, headers, rows, column_styles) in enumerate(sheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(headers, rows, column_styles))
 
 
-def sheet_xml(headers: list[str], rows: list[list[str]]) -> str:
+def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
+    column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    widths = [16, 28, 12, 16, 12, 14, 16, 16, 18, 12, 60, 16, 16, 34, 18]
+    widths = [16, 28, 12, 16, 12, 14, 16, 12, 16, 18, 12, 60, 16, 16, 34, 18]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
     )
     lines.append(f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>{cols}</cols><sheetData>')
-    lines.append(row_xml(1, headers, True))
+    lines.append(row_xml(1, headers, True, column_styles))
     for idx, row in enumerate(rows, start=2):
-        lines.append(row_xml(idx, row, False))
+        lines.append(row_xml(idx, row, False, column_styles))
     lines.append("</sheetData></worksheet>")
     return "".join(lines)
 
 
-def row_xml(row_no: int, values: list[str], header: bool) -> str:
+def row_xml(row_no: int, values: list[str], header: bool, column_styles: dict[int, int]) -> str:
     cells = []
-    style = ' s="1"' if header else ""
     for idx, value in enumerate(values, start=1):
         ref = f"{column_name(idx)}{row_no}"
+        style_id = 1 if header else column_styles.get(idx, 0)
+        style = f' s="{style_id}"' if style_id else ""
         if not header and isinstance(value, (int, float)) and value is not None:
             cells.append(f'<c r="{ref}"{style}><v>{value}</v></c>')
         elif value is None:
@@ -648,7 +686,7 @@ def workbook_xml(names: list[str]) -> str:
 
 
 def styles_xml() -> str:
-    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>"""
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0"/><numFmt numFmtId="165" formatCode="0.00%"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>"""
 
 
 def money(value: float | None) -> str:
