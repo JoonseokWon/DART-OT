@@ -230,9 +230,9 @@ class DartClient:
             with zipfile.ZipFile(BytesIO(data)) as archive:
                 for name in archive.namelist():
                     if name.lower().endswith(".xml"):
-                        files.append((name, archive.read(name).decode("utf-8", errors="ignore")))
+                        files.append((name, decode_dart_document(archive.read(name))))
         except zipfile.BadZipFile:
-            files.append((f"{receipt_no}.xml", data.decode("utf-8", errors="ignore")))
+            files.append((f"{receipt_no}.xml", decode_dart_document(data)))
         return files
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
@@ -288,6 +288,17 @@ def run_report(payload: dict) -> dict:
 
 def fail(message: str) -> dict:
     return {"ok": False, "message": message, "file": None, "reportCount": 0, "noteCount": 0, "testCount": 0}
+
+
+def decode_dart_document(data: bytes) -> str:
+    candidates: list[tuple[int, str]] = []
+    for encoding in ("utf-8", "cp949", "euc-kr"):
+        text = data.decode(encoding, errors="ignore")
+        keyword_score = sum(text.count(keyword) for keyword in BORROWING_KEYWORDS) * 1000
+        hangul_score = len(re.findall(r"[가-힣]", text))
+        broken_score = text.count("\ufffd") * 100
+        candidates.append((keyword_score + hangul_score - broken_score, text))
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def load_config() -> dict:
