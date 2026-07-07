@@ -714,6 +714,9 @@ class DartOtApp(tk.Tk):
         self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
 
         self._build()
+        self.company_var.trace_add("write", self.on_company_input_changed)
+        self.stock_var.trace_add("write", self.on_manual_code_changed)
+        self.corp_code_var.trace_add("write", self.on_manual_code_changed)
 
     def _build(self) -> None:
         self.configure(bg="#f6f8fb")
@@ -796,6 +799,10 @@ class DartOtApp(tk.Tk):
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
             return
 
+        self.selected_corp = None
+        self.corp_code_var.set("")
+        if self.company_var.get().strip():
+            self.stock_var.set("")
         self.persist_api_key()
         self.status_var.set("회사 목록을 조회하고 있습니다.")
         self._set_buttons_state("disabled")
@@ -832,9 +839,26 @@ class DartOtApp(tk.Tk):
             return
         index = int(selected[0])
         self.selected_corp = self.search_results[index]
+        self._updating_selection = True
         self.company_var.set(self.selected_corp.corp_name)
         self.stock_var.set(self.selected_corp.stock_code)
         self.corp_code_var.set(self.selected_corp.corp_code)
+        self._updating_selection = False
+
+    def on_company_input_changed(self, *_args) -> None:
+        if getattr(self, "_updating_selection", False):
+            return
+        self.selected_corp = None
+        if self.stock_var.get() or self.corp_code_var.get():
+            self._updating_selection = True
+            self.stock_var.set("")
+            self.corp_code_var.set("")
+            self._updating_selection = False
+
+    def on_manual_code_changed(self, *_args) -> None:
+        if getattr(self, "_updating_selection", False):
+            return
+        self.selected_corp = None
 
     def run_export(self) -> None:
         api_key = self.api_key_var.get().strip()
