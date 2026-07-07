@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -16,6 +17,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from xml.etree import ElementTree
 
 
@@ -81,11 +83,35 @@ class DartClient:
 
         if company_name.strip():
             needle = company_name.strip().lower()
+            exact = [corp for corp in corps if corp.corp_name.lower() == needle]
+            if exact:
+                return sorted(exact, key=lambda c: (not bool(c.stock_code), c.corp_name))[0]
             for corp in corps:
                 if needle in corp.corp_name.lower():
                     return corp
 
         return None
+
+    def search_corps(self, company_name: str, stock_code: str = "", limit: int = 100) -> list[CorpInfo]:
+        corps = self.get_corp_codes()
+        if stock_code.strip():
+            normalized = stock_code.strip().zfill(6)
+            return [corp for corp in corps if corp.stock_code == normalized][:limit]
+
+        needle = company_name.strip().lower()
+        if not needle:
+            return []
+
+        matches = [corp for corp in corps if needle in corp.corp_name.lower()]
+        return sorted(
+            matches,
+            key=lambda c: (
+                c.corp_name.lower() != needle,
+                not bool(c.stock_code),
+                len(c.corp_name),
+                c.corp_name,
+            ),
+        )[:limit]
 
     def get_corp_codes(self) -> list[CorpInfo]:
         data = self._get_bytes("https://opendart.fss.or.kr/api/corpCode.xml", {"crtfc_key": self.api_key})
@@ -466,13 +492,215 @@ def find_port() -> int:
     return 0
 
 
+class DartOtApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("DART-OT")
+        self.geometry("940x620")
+        self.minsize(860, 560)
+        self.selected_corp: CorpInfo | None = None
+        self.search_results: list[CorpInfo] = []
+        self.output_file: Path | None = None
+
+        self.api_key_var = tk.StringVar()
+        self.company_var = tk.StringVar(value="삼성전자")
+        self.stock_var = tk.StringVar()
+        self.corp_code_var = tk.StringVar()
+        self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 9))
+        self.end_year_var = tk.StringVar(value=str(datetime.now().year))
+        self.status_var = tk.StringVar(value="DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요.")
+        self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
+
+        self._build()
+
+    def _build(self) -> None:
+        self.configure(bg="#f6f8fb")
+        style = ttk.Style(self)
+        style.configure("TFrame", background="#f6f8fb")
+        style.configure("Panel.TFrame", background="#ffffff")
+        style.configure("TLabel", background="#f6f8fb", font=("Malgun Gothic", 10))
+        style.configure("Panel.TLabel", background="#ffffff", font=("Malgun Gothic", 10))
+        style.configure("Title.TLabel", background="#f6f8fb", font=("Malgun Gothic", 17, "bold"))
+        style.configure("Accent.TButton", font=("Malgun Gothic", 10, "bold"))
+
+        root = ttk.Frame(self, padding=20)
+        root.pack(fill="both", expand=True)
+
+        ttk.Label(root, text="DART-OT", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(root, text="DART 공시 기반 차입금 필터링 및 이자율 오버롤 테스트 파일 생성 도구").pack(anchor="w", pady=(2, 16))
+
+        body = ttk.Frame(root)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 14))
+        right = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self._entry(left, "DART API 키", self.api_key_var, show="*")
+        self._entry(left, "회사명", self.company_var)
+        self._entry(left, "종목코드", self.stock_var)
+        self._entry(left, "DART 고유번호", self.corp_code_var)
+
+        year_frame = ttk.Frame(left, style="Panel.TFrame")
+        year_frame.pack(fill="x", pady=(4, 0))
+        year_frame.columnconfigure(0, weight=1)
+        year_frame.columnconfigure(1, weight=1)
+        self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
+        self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
+
+        ttk.Button(left, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(14, 6))
+        ttk.Button(left, text="엑셀 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
+
+        ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("Malgun Gothic", 12, "bold")).grid(row=0, column=0, sticky="w")
+        columns = ("corp_name", "stock_code", "corp_code")
+        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=10)
+        self.tree.heading("corp_name", text="회사명")
+        self.tree.heading("stock_code", text="종목코드")
+        self.tree.heading("corp_code", text="DART 고유번호")
+        self.tree.column("corp_name", width=260)
+        self.tree.column("stock_code", width=90, anchor="center")
+        self.tree.column("corp_code", width=110, anchor="center")
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=(10, 12))
+        self.tree.bind("<<TreeviewSelect>>", self.select_company)
+
+        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=500, justify="left")
+        status.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(right, textvariable=self.summary_var, style="Panel.TLabel").grid(row=3, column=0, sticky="w")
+
+        buttons = ttk.Frame(right, style="Panel.TFrame")
+        buttons.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        ttk.Button(buttons, text="결과 파일 열기", command=self.open_output).pack(side="left")
+        ttk.Button(buttons, text="저장 폴더 열기", command=self.open_output_dir).pack(side="left", padx=(8, 0))
+
+    def _entry(self, parent, label: str, variable: tk.StringVar, show: str | None = None, width: int | None = None, grid_col: int | None = None) -> None:
+        container = ttk.Frame(parent, style="Panel.TFrame")
+        if grid_col is None:
+            container.pack(fill="x", pady=(0, 8))
+        else:
+            container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
+        ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Entry(container, textvariable=variable, show=show or "", width=width).pack(fill="x")
+
+    def search_company(self) -> None:
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
+            return
+
+        self.status_var.set("회사 목록을 조회하고 있습니다.")
+        self._set_buttons_state("disabled")
+        threading.Thread(target=self._search_company_worker, args=(api_key,), daemon=True).start()
+
+    def _search_company_worker(self, api_key: str) -> None:
+        try:
+            client = DartClient(api_key)
+            results = client.search_corps(self.company_var.get(), self.stock_var.get())
+            self.after(0, lambda: self._show_search_results(results))
+        except Exception as exc:
+            self.after(0, lambda: self._show_error(f"회사 검색 중 오류가 발생했습니다: {exc}"))
+
+    def _show_search_results(self, results: list[CorpInfo]) -> None:
+        self._set_buttons_state("normal")
+        self.search_results = results
+        self.selected_corp = None
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for idx, corp in enumerate(results):
+            self.tree.insert("", "end", iid=str(idx), values=(corp.corp_name, corp.stock_code, corp.corp_code))
+
+        if results:
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+            self.select_company()
+            self.status_var.set(f"검색 결과 {len(results)}건이 있습니다. 정확한 회사를 선택한 뒤 엑셀 파일 생성을 눌러 주세요.")
+        else:
+            self.status_var.set("검색 결과가 없습니다. 회사명 또는 종목코드를 다시 확인해 주세요.")
+
+    def select_company(self, _event=None) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        self.selected_corp = self.search_results[index]
+        self.company_var.set(self.selected_corp.corp_name)
+        self.stock_var.set(self.selected_corp.stock_code)
+        self.corp_code_var.set(self.selected_corp.corp_code)
+
+    def run_export(self) -> None:
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
+            return
+        if self.selected_corp is None and not self.corp_code_var.get().strip():
+            messagebox.showwarning("회사 선택 필요", "회사 검색 후 목록에서 회사를 선택해 주세요.")
+            return
+
+        self.status_var.set("DART 공시를 조회하고 엑셀 파일을 생성하고 있습니다. 보고서 수에 따라 시간이 걸릴 수 있습니다.")
+        self._set_buttons_state("disabled")
+        threading.Thread(target=self._run_export_worker, daemon=True).start()
+
+    def _run_export_worker(self) -> None:
+        payload = {
+            "apiKey": self.api_key_var.get(),
+            "companyName": self.company_var.get(),
+            "stockCode": self.stock_var.get(),
+            "corpCode": self.corp_code_var.get(),
+            "beginYear": self.begin_year_var.get(),
+            "endYear": self.end_year_var.get(),
+        }
+        try:
+            result = run_report(payload)
+            self.after(0, lambda: self._show_export_result(result))
+        except Exception as exc:
+            self.after(0, lambda: self._show_error(f"실행 중 오류가 발생했습니다: {exc}"))
+
+    def _show_export_result(self, result: dict) -> None:
+        self._set_buttons_state("normal")
+        self.status_var.set(result.get("message", "작업이 완료되었습니다."))
+        self.summary_var.set(
+            f"정기보고서: {result.get('reportCount', 0)}    "
+            f"차입금 공시: {result.get('noteCount', 0)}    "
+            f"오버롤 테스트: {result.get('testCount', 0)}"
+        )
+        if result.get("ok") and result.get("file"):
+            self.output_file = OUTPUT_DIR / result["file"]
+            messagebox.showinfo("완료", f"엑셀 파일을 생성했습니다.\n{self.output_file}")
+
+    def _show_error(self, message: str) -> None:
+        self._set_buttons_state("normal")
+        self.status_var.set(message)
+        messagebox.showerror("오류", message)
+
+    def _set_buttons_state(self, state: str) -> None:
+        for child in self.winfo_children():
+            self._set_state_recursive(child, state)
+
+    def _set_state_recursive(self, widget, state: str) -> None:
+        if isinstance(widget, ttk.Button):
+            widget.configure(state=state)
+        for child in widget.winfo_children():
+            self._set_state_recursive(child, state)
+
+    def open_output(self) -> None:
+        if self.output_file and self.output_file.exists():
+            os.startfile(self.output_file)
+        else:
+            messagebox.showinfo("결과 없음", "아직 생성된 결과 파일이 없습니다.")
+
+    def open_output_dir(self) -> None:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        os.startfile(OUTPUT_DIR)
+
+
 def main() -> None:
-    port = find_port()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}/"
-    print(f"DART-OT 실행 중: {url}")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    server.serve_forever()
+    app = DartOtApp()
+    app.mainloop()
 
 
 HTML_PAGE = r"""

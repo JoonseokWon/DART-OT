@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Windows.Forms;
 
 class Launcher
 {
@@ -10,16 +11,14 @@ class Launcher
         string app = Path.Combine(root, "app.py");
         if (!File.Exists(app))
         {
-            Console.WriteLine("app.py 파일을 찾을 수 없습니다.");
-            Console.ReadKey();
+            MessageBox.Show("app.py 파일을 찾을 수 없습니다.", "DART-OT");
             return 1;
         }
 
         string python = FindPython(root);
         if (python == null)
         {
-            Console.WriteLine("Python 실행 환경을 찾을 수 없습니다. _start.bat 또는 Python 설치 상태를 확인해 주세요.");
-            Console.ReadKey();
+            MessageBox.Show("Python 실행 환경을 찾을 수 없습니다. _start.bat 또는 Python 설치 상태를 확인해 주세요.", "DART-OT");
             return 1;
         }
 
@@ -28,6 +27,7 @@ class Launcher
         info.Arguments = "\"" + app + "\"";
         info.WorkingDirectory = root;
         info.UseShellExecute = false;
+        info.CreateNoWindow = true;
         Process.Start(info);
         return 0;
     }
