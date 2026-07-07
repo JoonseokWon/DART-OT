@@ -23,7 +23,7 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
-BORROWING_KEYWORDS = ["차입금", "사채", "이자율", "이자비용", "유동성장기", "단기차입", "장기차입"]
+BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공"]
 
 
 @dataclass
@@ -51,6 +51,21 @@ class BorrowingNote:
     stock_code: str
     summary: str
     special_matter: str
+
+
+@dataclass
+class BorrowingLine:
+    corp_name: str
+    report_name: str
+    receipt_date: str
+    receipt_no: str
+    keyword: str
+    interest_rates: list[float]
+    amounts: list[int]
+    max_amount: int
+    source_file: str
+    line_no: int
+    context: str
 
 
 @dataclass
@@ -156,21 +171,8 @@ class DartClient:
         return sorted(reports, key=lambda r: (r.receipt_date, r.report_name), reverse=True)
 
     def extract_borrowing_note(self, report: DartReport) -> BorrowingNote | None:
-        data = self._get_bytes(
-            "https://opendart.fss.or.kr/api/document.xml",
-            {"crtfc_key": self.api_key, "rcept_no": report.receipt_no},
-        )
-
-        chunks: list[str] = []
-        try:
-            with zipfile.ZipFile(BytesIO(data)) as archive:
-                for name in archive.namelist():
-                    if name.lower().endswith(".xml"):
-                        chunks.append(archive.read(name).decode("utf-8", errors="ignore"))
-        except zipfile.BadZipFile:
-            chunks.append(data.decode("utf-8", errors="ignore"))
-
-        plain = normalize_text(re.sub(r"<[^>]+>", " ", "\n".join(chunks)))
+        files = self.get_document_texts(report.receipt_no)
+        plain = normalize_text(re.sub(r"<[^>]+>", " ", "\n".join(text for _, text in files)))
         snippets = extract_snippets(plain)
         if not snippets:
             return None
@@ -185,6 +187,52 @@ class DartClient:
             summary,
             build_special_matter(summary),
         )
+
+    def extract_borrowing_lines(self, report: DartReport) -> list[BorrowingLine]:
+        files = self.get_document_texts(report.receipt_no)
+        rows: list[BorrowingLine] = []
+        for source_file, text in files:
+            for line_no, raw_line in enumerate(text.splitlines(), start=1):
+                context = clean_context(raw_line)
+                if not context:
+                    continue
+                keyword = next((k for k in BORROWING_KEYWORDS if k in context), "")
+                if not keyword:
+                    continue
+                rates = extract_rate_values(context)
+                amounts = extract_amount_values(context)
+                rows.append(
+                    BorrowingLine(
+                        report.corp_name,
+                        report.report_name,
+                        report.receipt_date,
+                        report.receipt_no,
+                        keyword,
+                        rates,
+                        amounts,
+                        max((abs(a) for a in amounts), default=0),
+                        Path(source_file).name or f"{report.receipt_no}.xml",
+                        line_no,
+                        context[:1200],
+                    )
+                )
+        return rows
+
+    def get_document_texts(self, receipt_no: str) -> list[tuple[str, str]]:
+        data = self._get_bytes(
+            "https://opendart.fss.or.kr/api/document.xml",
+            {"crtfc_key": self.api_key, "rcept_no": receipt_no},
+        )
+
+        files: list[tuple[str, str]] = []
+        try:
+            with zipfile.ZipFile(BytesIO(data)) as archive:
+                for name in archive.namelist():
+                    if name.lower().endswith(".xml"):
+                        files.append((name, archive.read(name).decode("utf-8", errors="ignore")))
+        except zipfile.BadZipFile:
+            files.append((f"{receipt_no}.xml", data.decode("utf-8", errors="ignore")))
+        return files
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
         return json.loads(self._get_bytes(url, params).decode("utf-8", errors="ignore"))
@@ -215,26 +263,24 @@ def run_report(payload: dict) -> dict:
     end_year = int(payload.get("endYear") or now_year)
 
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
-    notes: list[BorrowingNote] = []
+    borrowing_lines: list[BorrowingLine] = []
     for report in reports:
         try:
-            note = client.extract_borrowing_note(report)
-            if note:
-                notes.append(note)
+            borrowing_lines.extend(client.extract_borrowing_lines(report))
         except Exception:
             continue
 
-    tests = [interest_test_from_note(note) for note in notes]
+    tests = build_overall_tests(reports, borrowing_lines)
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-    save_workbook(OUTPUT_DIR / file_name, reports, notes, tests)
+    save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests)
 
     return {
         "ok": True,
-        "message": f"{corp.corp_name} 정기보고서 {len(reports)}건, 차입금 관련 공시 {len(notes)}건을 정리했습니다.",
+        "message": f"{corp.corp_name} 정기보고서 {len(reports)}건, 차입금 관련 문맥 {len(borrowing_lines)}건을 정리했습니다.",
         "file": file_name,
         "reportCount": len(reports),
-        "noteCount": len(notes),
+        "noteCount": len(borrowing_lines),
         "testCount": len(tests),
     }
 
@@ -250,6 +296,11 @@ def text_of(node: ElementTree.Element, tag: str) -> str:
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def clean_context(value: str) -> str:
+    value = re.sub(r"<[^>]+>", " ", value)
+    return normalize_text(value)
 
 
 def extract_snippets(plain: str) -> list[str]:
@@ -301,9 +352,79 @@ def interest_test_from_note(note: BorrowingNote) -> InterestTest:
     return InterestTest(note.corp_name, note.report_name, note.receipt_no, amount, rate, expected, actual, error, result)
 
 
+def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -> list[dict]:
+    by_receipt: dict[str, list[BorrowingLine]] = {}
+    for line in lines:
+        by_receipt.setdefault(line.receipt_no, []).append(line)
+
+    rows: list[dict] = []
+    prev_amount_sum: int | None = None
+    prev_avg_rate: float | None = None
+    for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
+        report_lines = by_receipt.get(report.receipt_no, [])
+        rates = [rate for line in report_lines for rate in line.interest_rates]
+        amount_sum = sum(line.max_amount for line in report_lines)
+        max_amount = max((line.max_amount for line in report_lines), default=0)
+        min_rate = min(rates) if rates else None
+        avg_rate = sum(rates) / len(rates) if rates else None
+        max_rate = max(rates) if rates else None
+
+        rate_change = None
+        if avg_rate is not None and prev_avg_rate not in (None, 0):
+            rate_change = (avg_rate - prev_avg_rate) / prev_avg_rate
+
+        amount_diff = None
+        amount_change = None
+        if prev_amount_sum not in (None, 0):
+            amount_diff = amount_sum - prev_amount_sum
+            amount_change = amount_diff / prev_amount_sum
+
+        issues: list[str] = []
+        if amount_change is not None and abs(amount_change) > 0.10:
+            issues.append("차입금 금액 변동 큼")
+        if rate_change is not None and abs(rate_change) > 0.05:
+            issues.append("이자율 전기 대비 변동 큼")
+
+        rows.append(
+            {
+                "corp_name": report.corp_name,
+                "report_name": report.report_name,
+                "receipt_date": report.receipt_date,
+                "receipt_no": report.receipt_no,
+                "context_count": len(report_lines),
+                "rate_count": len(rates),
+                "amount_sum": amount_sum,
+                "max_amount": max_amount,
+                "min_rate": min_rate,
+                "avg_rate": avg_rate,
+                "max_rate": max_rate,
+                "rate_change": rate_change,
+                "amount_diff": amount_diff,
+                "amount_change": amount_change,
+                "result": "정상범위" if not issues else "확인필요: " + ", ".join(issues),
+            }
+        )
+
+        prev_amount_sum = amount_sum
+        if avg_rate is not None:
+            prev_avg_rate = avg_rate
+
+    return rows
+
+
 def extract_rate(text: str) -> float | None:
     rates = [float(x) for x in re.findall(r"(\d{1,2}(?:\.\d{1,4})?)\s*%", text)]
     return sum(rates) / len(rates) if rates else None
+
+
+def extract_rate_values(text: str) -> list[float]:
+    rates: list[float] = []
+    for raw in re.findall(r"(\d{1,2}(?:\.\d{1,4})?)\s*%", text):
+        try:
+            rates.append(float(raw) / 100)
+        except ValueError:
+            continue
+    return rates
 
 
 def extract_amount(text: str) -> float | None:
@@ -318,6 +439,20 @@ def extract_amount(text: str) -> float | None:
     return max_value or None
 
 
+def extract_amount_values(text: str) -> list[int]:
+    values: list[int] = []
+    for match in re.finditer(r"(?<![\d.])(\(?-?\d{1,3}(?:,\d{3})+\)?)(?!\s*%)", text):
+        raw = match.group(1)
+        negative = raw.startswith("(") and raw.endswith(")")
+        raw = raw.strip("()").replace(",", "")
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        values.append(-abs(value) if negative else value)
+    return values
+
+
 def extract_actual_interest(text: str) -> float | None:
     match = re.search(r"이자비용.{0,80}?(\d{1,3}(?:,\d{3})+|\d+)\s*(백만원|억원|원)", text)
     if not match:
@@ -330,32 +465,69 @@ def extract_actual_interest(text: str) -> float | None:
     return value
 
 
-def save_workbook(path: Path, reports: list[DartReport], notes: list[BorrowingNote], tests: list[InterestTest]) -> None:
+def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLine], tests: list[dict]) -> None:
     sheets = [
         (
-            "정기보고서 목록",
+            "정기보고서목록",
             ["회사명", "보고서명", "접수일", "접수번호", "종목코드"],
             [[r.corp_name, r.report_name, r.receipt_date, r.receipt_no, r.stock_code] for r in reports],
         ),
         (
-            "차입금 필터링",
-            ["회사명", "보고서명", "접수일", "접수번호", "종목코드", "차입금 주석공시 내용", "특이사항"],
-            [[n.corp_name, n.report_name, n.receipt_date, n.receipt_no, n.stock_code, n.summary, n.special_matter] for n in notes],
-        ),
-        (
-            "이자율 오버롤 테스트",
-            ["회사명", "보고서명", "접수번호", "차입금 잔액 추정", "이자율 추정(%)", "기대 이자비용", "실제 이자비용 추정", "오차율(%)", "판정"],
+            "차입금필터링",
+            ["회사명", "보고서명", "접수일", "접수번호", "키워드", "이자율", "금액후보", "최대금액", "원문파일", "줄번호", "문맥"],
             [
                 [
-                    t.corp_name,
-                    t.report_name,
-                    t.receipt_no,
-                    money(t.borrowing_amount),
-                    percent(t.interest_rate),
-                    money(t.expected_interest),
-                    money(t.actual_interest),
-                    percent(t.error_rate),
-                    t.result,
+                    line.corp_name,
+                    line.report_name,
+                    line.receipt_date,
+                    line.receipt_no,
+                    line.keyword,
+                    format_rates(line.interest_rates),
+                    ", ".join(str(amount) for amount in line.amounts),
+                    line.max_amount,
+                    line.source_file,
+                    line.line_no,
+                    line.context,
+                ]
+                for line in lines
+            ],
+        ),
+        (
+            "이자율오버롤테스트",
+            [
+                "회사명",
+                "보고서명",
+                "접수일",
+                "접수번호",
+                "차입금문맥수",
+                "이자율검출수",
+                "검출금액합계",
+                "최대라인금액",
+                "최저이자율",
+                "평균이자율",
+                "최고이자율",
+                "이자율전기대비변동률",
+                "전기대비증감",
+                "전기대비변동률",
+                "결과",
+            ],
+            [
+                [
+                    t["corp_name"],
+                    t["report_name"],
+                    t["receipt_date"],
+                    t["receipt_no"],
+                    t["context_count"],
+                    t["rate_count"],
+                    t["amount_sum"],
+                    t["max_amount"],
+                    t["min_rate"],
+                    t["avg_rate"],
+                    t["max_rate"],
+                    t["rate_change"],
+                    t["amount_diff"],
+                    t["amount_change"],
+                    t["result"],
                 ]
                 for t in tests
             ],
@@ -374,7 +546,12 @@ def save_workbook(path: Path, reports: list[DartReport], notes: list[BorrowingNo
 
 def sheet_xml(headers: list[str], rows: list[list[str]]) -> str:
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    lines.append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+    widths = [16, 28, 12, 16, 12, 14, 16, 16, 18, 12, 60, 16, 16, 34, 18]
+    cols = "".join(
+        f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
+        for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
+    )
+    lines.append(f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>{cols}</cols><sheetData>')
     lines.append(row_xml(1, headers, True))
     for idx, row in enumerate(rows, start=2):
         lines.append(row_xml(idx, row, False))
@@ -387,8 +564,13 @@ def row_xml(row_no: int, values: list[str], header: bool) -> str:
     style = ' s="1"' if header else ""
     for idx, value in enumerate(values, start=1):
         ref = f"{column_name(idx)}{row_no}"
-        safe = html.escape(str(value or ""), quote=False)
-        cells.append(f'<c r="{ref}" t="inlineStr"{style}><is><t xml:space="preserve">{safe}</t></is></c>')
+        if not header and isinstance(value, (int, float)) and value is not None:
+            cells.append(f'<c r="{ref}"{style}><v>{value}</v></c>')
+        elif value is None:
+            cells.append(f'<c r="{ref}"{style}/>')
+        else:
+            safe = html.escape(str(value or ""), quote=False)
+            cells.append(f'<c r="{ref}" t="inlineStr"{style}><is><t xml:space="preserve">{safe}</t></is></c>')
     return f'<row r="{row_no}">{"".join(cells)}</row>'
 
 
@@ -429,6 +611,10 @@ def money(value: float | None) -> str:
 
 def percent(value: float | None) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".") if value is not None else ""
+
+
+def format_rates(values: list[float]) -> str:
+    return ", ".join(f"{value * 100:.2f}%" for value in values)
 
 
 def safe_filename(value: str) -> str:
