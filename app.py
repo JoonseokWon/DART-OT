@@ -427,16 +427,20 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         by_receipt.setdefault(line.receipt_no, []).append(line)
 
     rows: list[dict] = []
-    prev_amount_sum: int | None = None
-    prev_avg_rate: float | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
         report_lines = by_receipt.get(report.receipt_no, [])
-        rates = [rate for line in report_lines for rate in line.interest_rates]
+        borrowing_rate_lines = [line for line in report_lines if not is_wacc_context(line.context)]
+        wacc_lines = [line for line in report_lines if is_wacc_context(line.context)]
+        rates = [rate for line in borrowing_rate_lines for rate in line.interest_rates]
+        wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         amount_sum = sum(line.max_amount for line in report_lines)
         max_amount = max((line.max_amount for line in report_lines), default=0)
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
+        avg_wacc = sum(wacc_rates) / len(wacc_rates) if wacc_rates else None
+        wacc_diff = avg_rate - avg_wacc if avg_rate is not None and avg_wacc is not None else None
+        wacc_error_rate = wacc_diff / avg_wacc if wacc_diff is not None and avg_wacc not in (None, 0) else None
         amount_units = sorted({line.amount_unit for line in report_lines if line.max_amount and line.amount_unit})
         amount_unit = ""
         if len(amount_units) == 1:
@@ -444,21 +448,14 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        rate_change = None
-        if avg_rate is not None and prev_avg_rate not in (None, 0):
-            rate_change = (avg_rate - prev_avg_rate) / prev_avg_rate
-
-        amount_diff = None
-        amount_change = None
-        if prev_amount_sum not in (None, 0):
-            amount_diff = amount_sum - prev_amount_sum
-            amount_change = amount_diff / prev_amount_sum
-
-        issues: list[str] = []
-        if amount_change is not None and abs(amount_change) > 0.10:
-            issues.append("차입금 금액 변동 큼")
-        if rate_change is not None and abs(rate_change) > 0.05:
-            issues.append("이자율 전기 대비 변동 큼")
+        if avg_wacc is None:
+            result = "확인필요: WACC 정보 부족"
+        elif avg_rate is None:
+            result = "확인필요: 차입금 이자율 정보 부족"
+        elif wacc_error_rate is not None and abs(wacc_error_rate) <= 0.05:
+            result = "적정: WACC 대비 ±5% 이내"
+        else:
+            result = "확인필요: WACC 대비 오차범위 초과"
 
         rows.append(
             {
@@ -468,24 +465,26 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "receipt_no": report.receipt_no,
                 "context_count": len(report_lines),
                 "rate_count": len(rates),
+                "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
                 "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
                 "max_rate": max_rate,
-                "rate_change": rate_change,
-                "amount_diff": amount_diff,
-                "amount_change": amount_change,
-                "result": "정상범위" if not issues else "확인필요: " + ", ".join(issues),
+                "avg_wacc": avg_wacc,
+                "wacc_diff": wacc_diff,
+                "wacc_error_rate": wacc_error_rate,
+                "result": result,
             }
         )
 
-        prev_amount_sum = amount_sum
-        if avg_rate is not None:
-            prev_avg_rate = avg_rate
-
     return rows
+
+
+def is_wacc_context(text: str) -> bool:
+    upper_text = text.upper()
+    return "WACC" in upper_text or "가중평균자본비용" in text or "가중평균 자본비용" in text
 
 
 def extract_rate(text: str) -> float | None:
@@ -579,16 +578,17 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "접수일",
                 "접수번호",
                 "차입금문맥수",
-                "이자율검출수",
+                "차입금이자율검출수",
+                "WACC검출수",
                 "검출금액합계",
                 "최대라인금액",
                 "금액단위",
-                "최저이자율",
-                "평균이자율",
-                "최고이자율",
-                "이자율전기대비변동률",
-                "전기대비증감",
-                "전기대비변동률",
+                "최저차입이자율",
+                "평균차입이자율",
+                "최고차입이자율",
+                "평균WACC",
+                "WACC대비차이",
+                "WACC대비오차율",
                 "결과",
             ],
             [
@@ -599,20 +599,21 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["receipt_no"],
                     t["context_count"],
                     t["rate_count"],
+                    t["wacc_count"],
                     t["amount_sum"],
                     t["max_amount"],
                     t["amount_unit"],
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
-                    t["rate_change"],
-                    t["amount_diff"],
-                    t["amount_change"],
+                    t["avg_wacc"],
+                    t["wacc_diff"],
+                    t["wacc_error_rate"],
                     t["result"],
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 8: 2, 10: 3, 11: 3, 12: 3, 13: 3, 14: 2, 15: 3},
+            {5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 11: 3, 12: 3, 13: 3, 14: 3, 15: 3, 16: 3},
         ),
     ]
 
@@ -629,7 +630,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
 def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    widths = [16, 28, 12, 16, 12, 14, 16, 12, 16, 18, 12, 60, 16, 16, 34, 18]
+    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 14, 14, 16, 34, 18]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
