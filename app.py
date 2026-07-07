@@ -23,6 +23,7 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
+CONFIG_PATH = ROOT / ".dart_ot_config.json"
 BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공"]
 
 
@@ -287,6 +288,19 @@ def run_report(payload: dict) -> dict:
 
 def fail(message: str) -> dict:
     return {"ok": False, "message": message, "file": None, "reportCount": 0, "noteCount": 0, "testCount": 0}
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def text_of(node: ElementTree.Element, tag: str) -> str:
@@ -681,6 +695,7 @@ def find_port() -> int:
 class DartOtApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        self.config = load_config()
         self.title("DART-OT")
         self.geometry("940x620")
         self.minsize(860, 560)
@@ -688,7 +703,8 @@ class DartOtApp(tk.Tk):
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
 
-        self.api_key_var = tk.StringVar()
+        self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
+        self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
         self.company_var = tk.StringVar(value="삼성전자")
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
@@ -729,6 +745,7 @@ class DartOtApp(tk.Tk):
         right.columnconfigure(0, weight=1)
 
         self._entry(left, "DART API 키", self.api_key_var, show="*")
+        ttk.Checkbutton(left, text="API 키 저장", variable=self.save_api_key_var).pack(anchor="w", pady=(0, 8))
         self._entry(left, "회사명", self.company_var)
         self._entry(left, "종목코드", self.stock_var)
         self._entry(left, "DART 고유번호", self.corp_code_var)
@@ -779,6 +796,7 @@ class DartOtApp(tk.Tk):
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
             return
 
+        self.persist_api_key()
         self.status_var.set("회사 목록을 조회하고 있습니다.")
         self._set_buttons_state("disabled")
         threading.Thread(target=self._search_company_worker, args=(api_key,), daemon=True).start()
@@ -827,9 +845,19 @@ class DartOtApp(tk.Tk):
             messagebox.showwarning("회사 선택 필요", "회사 검색 후 목록에서 회사를 선택해 주세요.")
             return
 
+        self.persist_api_key()
         self.status_var.set("DART 공시를 조회하고 엑셀 파일을 생성하고 있습니다. 보고서 수에 따라 시간이 걸릴 수 있습니다.")
         self._set_buttons_state("disabled")
         threading.Thread(target=self._run_export_worker, daemon=True).start()
+
+    def persist_api_key(self) -> None:
+        if self.save_api_key_var.get():
+            save_config({"api_key": self.api_key_var.get().strip()})
+        elif CONFIG_PATH.exists():
+            try:
+                CONFIG_PATH.unlink()
+            except OSError:
+                pass
 
     def _run_export_worker(self) -> None:
         payload = {
