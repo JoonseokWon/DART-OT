@@ -33,15 +33,13 @@ DISPLAY_KEYWORDS = [
     "교환사채",
     "단기차입금",
     "장기차입금",
+    "유동성장기차입금",
     "차입금",
+    "회사채",
     "사채",
-    "금융부채",
     "담보제공",
-    "이자율",
-    "이율",
-    "금리",
-    "가중평균",
 ]
+NOTE_INTEREST_EXPENSE_KEYWORD = "차입관련 이자비용"
 
 
 @dataclass
@@ -515,6 +513,12 @@ def clean_context(value: str) -> str:
 
 def display_keyword_for_context(text: str) -> str:
     compact = re.sub(r"\s+", "", text)
+    if (
+        "상각후원가측정금융부채이자비용" in compact
+        and "기타금융부채이자비용" not in compact
+        and "리스부채" not in compact
+    ):
+        return NOTE_INTEREST_EXPENSE_KEYWORD
     for keyword in DISPLAY_KEYWORDS:
         if keyword in compact:
             return keyword
@@ -642,7 +646,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
         special_bond_mention_count = sum(1 for line in test_lines if is_special_bond_context(line.context))
-        special_bond_amount = calculate_special_bond_amount(amount_used_lines)
+        special_bond_amount = calculate_special_bond_amount(test_lines, amount_sum)
         special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
         special_bond_memo = special_bond_review_memo(special_bond_mention_count, special_bond_amount)
         min_rate = min(rates) if rates else None
@@ -798,12 +802,29 @@ def normalize_amount_to_million(value: int, unit: str) -> int:
     return value
 
 
-def calculate_special_bond_amount(lines: list[BorrowingLine]) -> int:
-    total = 0
+def calculate_special_bond_amount(lines: list[BorrowingLine], reference_amount: int | None = None) -> int:
+    financial_total = 0
+    report_context_totals: list[int] = []
+    seen_contexts: set[str] = set()
     for line in lines:
         if line.source_file == "fnlttSinglAcntAll.json":
-            total += extract_special_bond_amount_from_financial_context(line.context)
-    return total
+            financial_total += extract_special_bond_amount_from_financial_context(line.context)
+            continue
+
+        key = normalize_text(line.context)
+        if key in seen_contexts or not is_special_bond_amount_context(line.context):
+            continue
+        seen_contexts.add(key)
+        amount = extract_special_bond_amount_from_report_context(line)
+        if amount > 0:
+            report_context_totals.append(amount)
+
+    if reference_amount and reference_amount > 0:
+        report_context_totals = [amount for amount in report_context_totals if amount <= reference_amount * 1.2]
+
+    if financial_total > 0 and (not reference_amount or financial_total <= reference_amount * 1.2):
+        return financial_total
+    return max(report_context_totals, default=0)
 
 
 def extract_special_bond_amount_from_financial_context(text: str) -> int:
@@ -813,6 +834,75 @@ def extract_special_bond_amount_from_financial_context(text: str) -> int:
         if any(keyword in compact for keyword in ("전환사채", "신주인수권부사채", "교환사채")):
             total += int(raw_amount.replace(",", ""))
     return total
+
+
+def is_special_bond_amount_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if not is_special_bond_context(text):
+        return False
+    if not re.search(r"\d{1,3}(?:,\d{3})+", text):
+        return False
+    title_only_keywords = (
+        "◆click◆",
+        ".dsl",
+        "정관",
+        "발행및배정",
+        "삽입",
+        "변경",
+        "미상환신주인수권부사채등발행현황.dsl",
+    )
+    if any(keyword in compact for keyword in title_only_keywords):
+        return False
+    exclusion_keywords = (
+        "전환가액",
+        "행사가액",
+        "전환가격",
+        "행사기간",
+        "청구기간",
+        "전환청구기간",
+        "주식수",
+        "보통주식",
+        "희석",
+        "주당이익",
+        "가정(단위:주)",
+        "단위:주",
+        "전환가정",
+        "공정가치",
+        "시장가격",
+    )
+    if any(keyword in compact for keyword in exclusion_keywords):
+        return False
+    if "단위" in compact and "주" in compact:
+        return False
+    amount_markers = (
+        "장부금액",
+        "액면금액",
+        "권면총액",
+        "미상환잔액",
+        "잔액중",
+        "발행금액",
+        "발행가액",
+        "발행하였",
+        "사채발행",
+        "상계하는방법",
+    )
+    return any(keyword in compact for keyword in amount_markers)
+
+
+def extract_special_bond_amount_from_report_context(line: BorrowingLine) -> int:
+    values = [normalize_amount_to_million(abs(value), line.amount_unit) for value in line.amounts if abs(value) > 0]
+    if not values:
+        return 0
+    compact = re.sub(r"\s+", "", line.context)
+    if any(keyword in compact for keyword in ("보통주식", "전환청구기간", "행사기간", "주식수", "단위:주")):
+        return max(values)
+    unique_values = list(dict.fromkeys(values))
+    if len(unique_values) >= 3:
+        largest = max(unique_values)
+        rest_sum = sum(unique_values) - largest
+        if rest_sum and abs(largest - rest_sum) <= max(1, largest * 0.01):
+            return largest
+    return sum(unique_values)
 
 
 def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpense | None:
