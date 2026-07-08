@@ -174,6 +174,61 @@ class DartClient:
                 )
         return sorted(reports, key=lambda r: (r.receipt_date, r.report_name), reverse=True)
 
+    def extract_financial_borrowing_line(self, corp_code: str, report: DartReport) -> BorrowingLine | None:
+        bsns_year = report_business_year(report)
+        reprt_code = report_code(report)
+        if not bsns_year or not reprt_code:
+            return None
+
+        rows: list[dict] = []
+        for fs_div in ("CFS", "OFS"):
+            data = self._get_json(
+                "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
+                {
+                    "crtfc_key": self.api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": bsns_year,
+                    "reprt_code": reprt_code,
+                    "fs_div": fs_div,
+                },
+            )
+            if data.get("status") == "000" and data.get("list"):
+                rows = data.get("list", [])
+                break
+
+        selected: list[tuple[str, int]] = []
+        for row in rows:
+            if row.get("sj_nm") != "재무상태표":
+                continue
+            account = normalize_text(row.get("account_nm", ""))
+            if not is_financial_borrowing_account(account):
+                continue
+            amount = parse_dart_amount(row.get("thstrm_amount", ""))
+            if amount is None or amount <= 0:
+                continue
+            selected.append((account, amount // 1_000_000))
+
+        if not selected:
+            return None
+
+        total = sum(amount for _, amount in selected)
+        detail = ", ".join(f"{name} {amount:,}" for name, amount in selected)
+        context = f"재무제표API 차입금 합계 {total:,}백만원 ({detail})"
+        return BorrowingLine(
+            report.corp_name,
+            report.report_name,
+            report.receipt_date,
+            report.receipt_no,
+            "재무제표API",
+            [],
+            [total],
+            "백만원",
+            total,
+            "fnlttSinglAcntAll.json",
+            0,
+            context,
+        )
+
     def extract_borrowing_note(self, report: DartReport) -> BorrowingNote | None:
         files = self.get_document_texts(report.receipt_no)
         plain = normalize_text(re.sub(r"<[^>]+>", " ", "\n".join(text for _, text in files)))
@@ -270,6 +325,12 @@ def run_report(payload: dict) -> dict:
     borrowing_lines: list[BorrowingLine] = []
     for report in reports:
         try:
+            financial_line = client.extract_financial_borrowing_line(corp.corp_code, report)
+            if financial_line is not None:
+                borrowing_lines.append(financial_line)
+        except Exception:
+            pass
+        try:
             borrowing_lines.extend(client.extract_borrowing_lines(report))
         except Exception:
             continue
@@ -324,6 +385,53 @@ def text_of(node: ElementTree.Element, tag: str) -> str:
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def report_business_year(report: DartReport) -> str:
+    match = re.search(r"\((\d{4})\.\d{2}\)", report.report_name)
+    if match:
+        return match.group(1)
+    return (report.receipt_date or "")[:4]
+
+
+def report_code(report: DartReport) -> str:
+    name = report.report_name
+    if "사업보고서" in name:
+        return "11011"
+    if "반기보고서" in name:
+        return "11012"
+    if "분기보고서" in name and ".03" in name:
+        return "11013"
+    if "분기보고서" in name and ".09" in name:
+        return "11014"
+    return ""
+
+
+def parse_dart_amount(value: str) -> int | None:
+    cleaned = str(value or "").replace(",", "").strip()
+    if not cleaned or cleaned == "-":
+        return None
+    try:
+        return abs(int(cleaned))
+    except ValueError:
+        return None
+
+
+def is_financial_borrowing_account(account: str) -> bool:
+    compact = re.sub(r"\s+", "", account)
+    exact_accounts = {
+        "단기차입금",
+        "장기차입금",
+        "사채",
+        "유동성장기부채",
+        "유동성장기차입금",
+        "유동성사채",
+    }
+    if compact in exact_accounts:
+        return True
+    if any(excluded in compact for excluded in ("리스", "이자", "파생", "충당", "순확정")):
+        return False
+    return compact.endswith("차입금") or compact.endswith("사채")
 
 
 def clean_context(value: str) -> str:
@@ -454,7 +562,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
-        amount_units = sorted({line.amount_unit for line in test_lines if line.max_amount and line.amount_unit})
+        amount_units = sorted({line.amount_unit for line in amount_used_lines if line.max_amount and line.amount_unit})
         amount_unit = ""
         if len(amount_units) == 1:
             amount_unit = amount_units[0]
