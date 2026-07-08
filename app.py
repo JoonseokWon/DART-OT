@@ -902,13 +902,13 @@ class DartOtApp(tk.Tk):
         super().__init__()
         self.config = load_config()
         self.title("DART-OT")
-        self.geometry("1180x760")
-        self.minsize(1040, 680)
+        self.geometry("1280x820")
+        self.minsize(1180, 760)
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
-        self.tk.call("tk", "scaling", 1.0)
-        self.entry_font = ("맑은 고딕", 10)
+        self.tk.call("tk", "scaling", 1.35)
+        self.entry_font = ("맑은 고딕", 12)
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
@@ -926,22 +926,26 @@ class DartOtApp(tk.Tk):
         self.configure(bg="#f6f8fb")
         for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
             try:
-                tkfont.nametofont(font_name).configure(family="맑은 고딕", size=10)
+                tkfont.nametofont(font_name).configure(family="맑은 고딕", size=12)
             except tk.TclError:
                 pass
         style = ttk.Style(self)
         style.configure("TFrame", background="#f6f8fb")
         style.configure("Panel.TFrame", background="#ffffff")
-        style.configure("TLabel", background="#f6f8fb", font=("Malgun Gothic", 10))
-        style.configure("Panel.TLabel", background="#ffffff", font=("Malgun Gothic", 10))
-        style.configure("Title.TLabel", background="#f6f8fb", font=("Malgun Gothic", 17, "bold"))
-        style.configure("Accent.TButton", font=("Malgun Gothic", 10, "bold"))
+        style.configure("TLabel", background="#f6f8fb", font=("맑은 고딕", 12))
+        style.configure("Panel.TLabel", background="#ffffff", font=("맑은 고딕", 12))
+        style.configure("Title.TLabel", background="#f6f8fb", font=("맑은 고딕", 22, "bold"))
+        style.configure("TButton", font=("맑은 고딕", 12), padding=(8, 6))
+        style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8))
+        style.configure("TCheckbutton", background="#ffffff", font=("맑은 고딕", 12))
+        style.configure("Treeview", font=("맑은 고딕", 11), rowheight=30)
+        style.configure("Treeview.Heading", font=("맑은 고딕", 11, "bold"))
 
-        root = ttk.Frame(self, padding=20)
+        root = ttk.Frame(self, padding=24)
         root.pack(fill="both", expand=True)
 
         ttk.Label(root, text="DART-OT", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(root, text="DART 공시 기반 차입금 필터링 및 이자율 오버롤 테스트 파일 생성 도구").pack(anchor="w", pady=(2, 16))
+        ttk.Label(root, text="DART 공시 기반 차입금 필터링 및 이자율 오버롤 테스트 파일 생성 도구").pack(anchor="w", pady=(4, 20))
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True)
@@ -949,9 +953,9 @@ class DartOtApp(tk.Tk):
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(body, style="Panel.TFrame", padding=16)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 14))
-        right = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        left = ttk.Frame(body, style="Panel.TFrame", padding=20)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 18))
+        right = ttk.Frame(body, style="Panel.TFrame", padding=20)
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
@@ -969,22 +973,22 @@ class DartOtApp(tk.Tk):
         self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
         self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
 
-        ttk.Button(left, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(14, 6))
+        ttk.Button(left, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(18, 8))
         ttk.Button(left, text="엑셀 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
 
-        ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("Malgun Gothic", 12, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("맑은 고딕", 14, "bold")).grid(row=0, column=0, sticky="w")
         columns = ("corp_name", "stock_code", "corp_code")
         self.tree = ttk.Treeview(right, columns=columns, show="headings", height=14)
         self.tree.heading("corp_name", text="회사명")
         self.tree.heading("stock_code", text="종목코드")
         self.tree.heading("corp_code", text="DART 고유번호")
-        self.tree.column("corp_name", width=360)
-        self.tree.column("stock_code", width=110, anchor="center")
-        self.tree.column("corp_code", width=140, anchor="center")
+        self.tree.column("corp_name", width=430)
+        self.tree.column("stock_code", width=140, anchor="center")
+        self.tree.column("corp_code", width=170, anchor="center")
         self.tree.grid(row=1, column=0, sticky="nsew", pady=(10, 12))
         self.tree.bind("<<TreeviewSelect>>", self.select_company)
 
-        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=720, justify="left")
+        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=820, justify="left")
         status.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(right, textvariable=self.summary_var, style="Panel.TLabel").grid(row=3, column=0, sticky="w")
 
