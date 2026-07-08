@@ -27,6 +27,21 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공"]
+DISPLAY_KEYWORDS = [
+    "전환사채",
+    "신주인수권부사채",
+    "교환사채",
+    "단기차입금",
+    "장기차입금",
+    "차입금",
+    "사채",
+    "금융부채",
+    "담보제공",
+    "이자율",
+    "이율",
+    "금리",
+    "가중평균",
+]
 
 
 @dataclass
@@ -287,7 +302,7 @@ class DartClient:
             for line_no, context, amount_unit in extract_text_records(text):
                 if not context:
                     continue
-                keyword = next((k for k in BORROWING_KEYWORDS if k in context), "")
+                keyword = display_keyword_for_context(context)
                 if not keyword:
                     continue
                 rates = extract_rate_values(context)
@@ -496,6 +511,14 @@ def is_finance_cost_account(account: str) -> bool:
 def clean_context(value: str) -> str:
     value = re.sub(r"<[^>]+>", " ", value)
     return normalize_text(value)
+
+
+def display_keyword_for_context(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    for keyword in DISPLAY_KEYWORDS:
+        if keyword in compact:
+            return keyword
+    return ""
 
 
 def extract_text_records(text: str) -> list[tuple[int, str, str]]:
