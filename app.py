@@ -469,6 +469,23 @@ def report_period_months(report: DartReport) -> int:
     return 12
 
 
+def report_period_key(report: DartReport) -> tuple[int, int] | None:
+    match = re.search(r"\((\d{4})\.(\d{2})\)", report.report_name)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    year = report_business_year(report)
+    if year.isdigit():
+        return int(year), report_period_months(report)
+    return None
+
+
+def report_period_label(report: DartReport) -> str:
+    key = report_period_key(report)
+    if not key:
+        return ""
+    return f"{key[0]}.{key[1]:02d}"
+
+
 def parse_dart_amount(value: str) -> int | None:
     cleaned = str(value or "").replace(",", "").strip()
     if not cleaned or cleaned == "-":
@@ -623,6 +640,18 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
     for line in lines:
         by_receipt.setdefault(line.receipt_no, []).append(line)
 
+    amount_cache: dict[str, tuple[int, int, str, list[BorrowingLine]]] = {}
+    for report in reports:
+        report_lines = by_receipt.get(report.receipt_no, [])
+        test_lines = [line for line in report_lines if not is_comparison_rate_context(line.context)]
+        amount_cache[report.receipt_no] = calculate_borrowing_amount(test_lines)
+
+    latest_report_by_period: dict[tuple[int, int], DartReport] = {}
+    for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
+        key = report_period_key(report)
+        if key:
+            latest_report_by_period[key] = report
+
     rows: list[dict] = []
     prev_amount_sum: int | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
@@ -642,9 +671,13 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             benchmark_label = "평균차입이자율 미공시(WACC 참고검출)"
         else:
             benchmark_label = "평균차입이자율 미공시"
-        amount_sum, max_amount, amount_method, amount_used_lines = calculate_borrowing_amount(test_lines)
-        amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
-        amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
+        amount_sum, max_amount, amount_method, amount_used_lines = amount_cache.get(report.receipt_no, (0, 0, "차입금 잔액 후보 없음", []))
+        period_key = report_period_key(report)
+        yoy_report = latest_report_by_period.get((period_key[0] - 1, period_key[1])) if period_key else None
+        yoy_amount_sum = amount_cache.get(yoy_report.receipt_no, (None, 0, "", []))[0] if yoy_report else None
+        amount_diff = amount_sum - yoy_amount_sum if yoy_amount_sum is not None else None
+        amount_change = amount_diff / yoy_amount_sum if amount_diff is not None and yoy_amount_sum not in (None, 0) else None
+        amount_comparison_label = f"전년동기 {report_period_label(yoy_report)}" if yoy_report else "전년동기 비교대상 없음"
         special_bond_mention_count = sum(1 for line in test_lines if is_special_bond_context(line.context))
         special_bond_amount = calculate_special_bond_amount(test_lines, amount_sum)
         special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
@@ -683,7 +716,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
 
         caution_reasons: list[str] = []
         if amount_change is not None and abs(amount_change) >= 0.30:
-            caution_reasons.append(f"전기 대비 검출금액합계가 {amount_change:.2%} 변동하여 30% 기준을 초과했습니다.")
+            caution_reasons.append(f"전년동기 대비 검출금액합계가 {amount_change:.2%} 변동하여 30% 기준을 초과했습니다.")
         if special_bond_ratio is not None and special_bond_ratio > 0.30:
             caution_reasons.append(f"전환사채/신주인수권부사채 등 특수사채 비중이 {special_bond_ratio:.2%}로 30%를 초과했습니다.")
         caution_status = "주의요망" if caution_reasons else ""
@@ -703,6 +736,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
                 "amount_method": amount_method,
+                "amount_comparison_label": amount_comparison_label,
                 "amount_diff": amount_diff,
                 "amount_change": amount_change,
                 "special_bond_amount": special_bond_amount,
@@ -1224,8 +1258,9 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "최대라인금액",
                 "금액산정방식",
                 "금액단위",
-                "전기대비증감",
-                "전기대비변동률",
+                "증감비교대상",
+                "전년동기대비증감",
+                "전년동기대비변동률",
                 "특수사채금액",
                 "특수사채비중",
                 "특수사채검토메모",
@@ -1255,6 +1290,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["max_amount"],
                     t["amount_method"],
                     t["amount_unit"],
+                    t["amount_comparison_label"],
                     t["amount_diff"],
                     t["amount_change"],
                     t["special_bond_amount"],
@@ -1277,7 +1313,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 10: 2, 11: 3, 12: 2, 13: 3, 15: 3, 16: 3, 17: 3, 18: 2, 19: 2, 20: 2, 21: 2, 23: 2, 24: 3},
+            {5: 2, 6: 2, 7: 2, 11: 2, 12: 3, 13: 2, 14: 3, 16: 3, 17: 3, 18: 3, 19: 2, 20: 2, 21: 2, 22: 2, 24: 2, 25: 3},
         ),
     ]
 
