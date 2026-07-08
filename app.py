@@ -893,6 +893,7 @@ class DartOtApp(tk.Tk):
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
+        self.entry_font = ("Malgun Gothic", 10)
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
@@ -979,7 +980,20 @@ class DartOtApp(tk.Tk):
         else:
             container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
         ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
-        ttk.Entry(container, textvariable=variable, show=show or "", width=width).pack(fill="x")
+        entry = tk.Entry(
+            container,
+            textvariable=variable,
+            show=show or "",
+            width=width or 20,
+            font=self.entry_font,
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground="#cbd5e1",
+            highlightcolor="#0f766e",
+            insertwidth=1,
+        )
+        entry.pack(fill="x", ipady=5)
 
     def search_company(self) -> None:
         api_key = self.api_key_var.get().strip()
