@@ -1,4 +1,5 @@
 import html
+import ctypes
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
 from xml.etree import ElementTree
 
 
@@ -883,6 +885,18 @@ def find_port() -> int:
     return 0
 
 
+def configure_windows_dpi() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 class DartOtApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -893,7 +907,8 @@ class DartOtApp(tk.Tk):
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
-        self.entry_font = ("Malgun Gothic", 10)
+        self.tk.call("tk", "scaling", 1.0)
+        self.entry_font = ("맑은 고딕", 10)
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
@@ -909,6 +924,11 @@ class DartOtApp(tk.Tk):
 
     def _build(self) -> None:
         self.configure(bg="#f6f8fb")
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
+            try:
+                tkfont.nametofont(font_name).configure(family="맑은 고딕", size=10)
+            except tk.TclError:
+                pass
         style = ttk.Style(self)
         style.configure("TFrame", background="#f6f8fb")
         style.configure("Panel.TFrame", background="#ffffff")
@@ -1125,6 +1145,7 @@ class DartOtApp(tk.Tk):
 
 
 def main() -> None:
+    configure_windows_dpi()
     app = DartOtApp()
     app.mainloop()
 
