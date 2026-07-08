@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 
@@ -54,6 +55,126 @@ def clean_text(value: str) -> str:
     value = re.sub(r"<[^>]+>", " ", value)
     value = html.unescape(value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def highlight_text(value: str, keyword: str) -> str:
+    escaped = html.escape(value)
+    needle = keyword.strip()
+    if not needle:
+        return escaped
+    pattern = re.compile(re.escape(html.escape(needle)), re.IGNORECASE)
+    return pattern.sub(lambda match: f"<mark>{match.group(0)}</mark>", escaped)
+
+
+class DartDocumentRenderer(HTMLParser):
+    block_tags = {"document", "cover", "section", "part", "chapter", "body"}
+    paragraph_tags = {"p", "div", "span"}
+    title_tags = {"title", "subtitle"}
+    table_tags = {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
+
+    def __init__(self, keyword: str = ""):
+        super().__init__(convert_charrefs=True)
+        self.keyword = keyword
+        self.parts: list[str] = []
+        self.open_blocks: list[str] = []
+
+    def render(self, text: str) -> str:
+        prepared = re.sub(r"<\?xml[^>]*>", "", text, flags=re.IGNORECASE)
+        prepared = re.sub(r"<!DOCTYPE[^>]*>", "", prepared, flags=re.IGNORECASE)
+        prepared = prepared.replace("&cr;", "<br>").replace("&#13;", "<br>")
+        self.feed(prepared)
+        self.close()
+        while self.open_blocks:
+            self.parts.append(f"</{self.open_blocks.pop()}>")
+        return "".join(self.parts).strip()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs_dict = {name.lower(): (value or "") for name, value in attrs}
+        if tag in self.block_tags:
+            self.parts.append('<div class="dart-block">')
+            self.open_blocks.append("div")
+            return
+        if tag in self.title_tags:
+            self.parts.append('<h2 class="dart-title">')
+            self.open_blocks.append("h2")
+            return
+        if tag in self.paragraph_tags:
+            self.parts.append("<p>")
+            self.open_blocks.append("p")
+            return
+        if tag == "br":
+            self.parts.append("<br>")
+            return
+        if tag == "table":
+            self.parts.append('<table class="dart-table">')
+            self.open_blocks.append("table")
+            return
+        if tag in {"thead", "tbody", "tfoot"}:
+            self.parts.append(f"<{tag}>")
+            self.open_blocks.append(tag)
+            return
+        if tag == "tr":
+            self.parts.append("<tr>")
+            self.open_blocks.append("tr")
+            return
+        if tag in {"td", "th"}:
+            safe_attrs = []
+            for attr_name in ("colspan", "rowspan"):
+                raw = attrs_dict.get(attr_name, "")
+                if raw.isdigit() and 1 <= int(raw) <= 100:
+                    safe_attrs.append(f'{attr_name}="{raw}"')
+            align = attrs_dict.get("align", "").lower()
+            if align in {"left", "center", "right"}:
+                safe_attrs.append(f'style="text-align:{align}"')
+            suffix = " " + " ".join(safe_attrs) if safe_attrs else ""
+            self.parts.append(f"<{tag}{suffix}>")
+            self.open_blocks.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        target = None
+        if tag in self.block_tags:
+            target = "div"
+        elif tag in self.title_tags:
+            target = "h2"
+        elif tag in self.paragraph_tags:
+            target = "p"
+        elif tag in self.table_tags:
+            target = tag
+        if target and target in self.open_blocks:
+            while self.open_blocks:
+                current = self.open_blocks.pop()
+                self.parts.append(f"</{current}>")
+                if current == target:
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+        cleaned = data.replace("\r\n", "\n").replace("\r", "\n")
+        if not cleaned.strip():
+            return
+        self.parts.append(highlight_text(cleaned, self.keyword).replace("\n", "<br>"))
+
+    def handle_entityref(self, name: str) -> None:
+        self.handle_data(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        self.handle_data(html.unescape(f"&#{name};"))
+
+
+def render_dart_document_html(files: list[tuple[str, str]], keyword: str = "") -> str:
+    rendered: list[str] = []
+    for source, text in files:
+        body = DartDocumentRenderer(keyword).render(text)
+        if body:
+            rendered.append(
+                f'<article class="dart-document">'
+                f'<div class="source-name">{html.escape(source)}</div>'
+                f"{body}</article>"
+            )
+    return "".join(rendered)
 
 
 def text_of(node: ElementTree.Element, tag: str) -> str:
@@ -148,7 +269,7 @@ class DartClient:
             page += 1
         return sorted(rows, key=lambda r: (r["receiptDate"], r["receiptNo"]), reverse=True)
 
-    def get_document_records(self, receipt_no: str, keyword: str = "", limit: int = 500) -> list[dict]:
+    def get_document_files(self, receipt_no: str) -> list[tuple[str, str]]:
         data = self._get_bytes("https://opendart.fss.or.kr/api/document.xml", {"crtfc_key": self.api_key, "rcept_no": receipt_no})
         files: list[tuple[str, str]] = []
         try:
@@ -158,20 +279,16 @@ class DartClient:
                         files.append((Path(name).name, decode_dart_document(archive.read(name))))
         except zipfile.BadZipFile:
             files.append((f"{receipt_no}.xml", decode_dart_document(data)))
+        return files
 
-        records: list[dict] = []
-        needle = keyword.strip().lower()
-        for source, text in files:
-            for line_no, raw in enumerate(text.splitlines(), start=1):
-                context = clean_text(raw)
-                if len(context) < 2:
-                    continue
-                if needle and needle not in context.lower():
-                    continue
-                records.append({"source": source, "lineNo": line_no, "text": context[:2000]})
-                if len(records) >= limit:
-                    return records
-        return records
+    def get_document_html(self, receipt_no: str, keyword: str = "") -> dict:
+        files = self.get_document_files(receipt_no)
+        rendered = render_dart_document_html(files, keyword)
+        keyword_count = 0
+        if keyword.strip():
+            needle = re.compile(re.escape(keyword.strip()), re.IGNORECASE)
+            keyword_count = sum(len(needle.findall(clean_text(text))) for _, text in files)
+        return {"html": rendered, "fileCount": len(files), "keywordCount": keyword_count}
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
         return json.loads(self._get_bytes(url, params).decode("utf-8", errors="ignore"))
@@ -205,8 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json({"ok": False, "message": "API 키와 접수번호가 필요합니다."})
                 return
             try:
-                records = DartClient(api_key).get_document_records(receipt_no, keyword)
-                self.json({"ok": True, "records": records, "count": len(records)})
+                document = DartClient(api_key).get_document_html(receipt_no, keyword)
+                self.json({"ok": True, **document})
             except Exception as exc:
                 self.json({"ok": False, "message": str(exc)})
             return
@@ -306,9 +423,16 @@ HTML_PAGE = r"""
     tr:hover td { background:#f7fbfa; }
     .nowrap { white-space:nowrap; }
     .muted { color:var(--muted); }
-    .doc { display:grid; gap:8px; }
-    .record { border:1px solid var(--line); border-radius:6px; padding:10px; background:#fbfcfe; }
-    .record .meta { font-size:12px; color:var(--muted); margin-bottom:6px; }
+    .doc { background:#fff; border:1px solid var(--line); border-radius:8px; padding:18px; overflow:auto; line-height:1.55; }
+    .dart-document { max-width:1180px; margin:0 auto 28px; color:#111827; }
+    .source-name { position:sticky; top:0; z-index:2; margin:-18px -18px 16px; padding:10px 18px; background:#f8fafc; border-bottom:1px solid var(--line); color:var(--muted); font-size:13px; font-weight:700; }
+    .dart-title { margin:22px 0 12px; font-size:20px; line-height:1.35; border-bottom:2px solid #111827; padding-bottom:8px; }
+    .dart-block { margin:8px 0; }
+    .dart-document p { margin:8px 0; min-height:1em; }
+    .dart-table { width:100%; border-collapse:collapse; table-layout:auto; margin:12px 0 18px; font-size:13px; background:#fff; }
+    .dart-table th, .dart-table td { border:1px solid #9ca3af; padding:6px 8px; vertical-align:top; white-space:pre-wrap; }
+    .dart-table th { position:static; background:#f3f4f6; font-weight:800; }
+    .dart-document mark { background:#fff3a3; padding:0 2px; }
     .viewer-tools { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
     .viewer-tools input { max-width:260px; }
     @media (max-width:900px) { main { grid-template-columns:1fr; height:auto; } }
@@ -455,6 +579,17 @@ HTML_PAGE = r"""
           <div>${r.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</div>
         </div>`).join("") || "표시할 원문이 없습니다. 검색어를 바꿔보세요.";
     }
+    reloadDoc = async function() {
+      if (!selectedReceiptNo) return;
+      $("docRecords").innerHTML = "원문을 불러오는 중입니다.";
+      const q = new URLSearchParams({ apiKey:$("apiKey").value, receiptNo:selectedReceiptNo, keyword:$("docKeyword").value });
+      const data = await fetch(`/api/document?${q}`).then(r => r.json());
+      if (!data.ok) { $("docRecords").textContent = data.message; return; }
+      $("docRecords").innerHTML = data.html || "표시할 원문이 없습니다. 검색어를 바꿔보세요.";
+      if ($("docKeyword").value && data.keywordCount === 0) {
+        $("docRecords").insertAdjacentHTML("afterbegin", `<div class="status">검색어가 원문에서 발견되지 않았습니다. 원문 전체를 표시합니다.</div>`);
+      }
+    };
     $("reloadDoc").onclick = reloadDoc;
     $("tabList").onclick = () => showTab("list");
     $("tabDoc").onclick = () => showTab("doc");
