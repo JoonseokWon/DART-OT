@@ -549,7 +549,12 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         avg_borrowing_rates = [rate for line in avg_borrowing_rate_lines for rate in line.interest_rates]
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         benchmark_rates = avg_borrowing_rates
-        benchmark_label = "평균차입이자율" if avg_borrowing_rates else ""
+        if avg_borrowing_rates:
+            benchmark_label = "평균차입이자율"
+        elif wacc_rates:
+            benchmark_label = "평균차입이자율 미공시(WACC 참고검출)"
+        else:
+            benchmark_label = "평균차입이자율 미공시"
         amount_sum, max_amount, amount_method, amount_used_lines = calculate_borrowing_amount(test_lines)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
@@ -570,7 +575,10 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
             amount_unit = "혼합: " + ", ".join(amount_units)
 
         if avg_benchmark_rate is None:
-            result = "비교불가: 비교기준(평균차입이자율) 정보 부족"
+            if wacc_rates:
+                result = "검토필요: 평균차입이자율 미공시. WACC는 참고검출만 가능하여 자동 비교 제외"
+            else:
+                result = "검토필요: 평균차입이자율 미공시로 자동 비교 불가"
         elif avg_rate is None:
             result = "비교불가: 차입금 이자율 정보 부족"
         elif benchmark_error_rate is not None and abs(benchmark_error_rate) <= 0.05:
@@ -594,7 +602,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "receipt_no": report.receipt_no,
                 "context_count": len(test_lines),
                 "rate_count": len(rates),
-                "benchmark_type": benchmark_label if benchmark_rates else "",
+                "benchmark_type": benchmark_label,
                 "benchmark_count": len(benchmark_rates),
                 "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
