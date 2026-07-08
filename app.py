@@ -902,8 +902,8 @@ class DartOtApp(tk.Tk):
         super().__init__()
         self.config = load_config()
         self.title("DART-OT")
-        self.geometry("940x620")
-        self.minsize(860, 560)
+        self.geometry("1180x760")
+        self.minsize(1040, 680)
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
@@ -974,17 +974,17 @@ class DartOtApp(tk.Tk):
 
         ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("Malgun Gothic", 12, "bold")).grid(row=0, column=0, sticky="w")
         columns = ("corp_name", "stock_code", "corp_code")
-        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=10)
+        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=14)
         self.tree.heading("corp_name", text="회사명")
         self.tree.heading("stock_code", text="종목코드")
         self.tree.heading("corp_code", text="DART 고유번호")
-        self.tree.column("corp_name", width=260)
-        self.tree.column("stock_code", width=90, anchor="center")
-        self.tree.column("corp_code", width=110, anchor="center")
+        self.tree.column("corp_name", width=360)
+        self.tree.column("stock_code", width=110, anchor="center")
+        self.tree.column("corp_code", width=140, anchor="center")
         self.tree.grid(row=1, column=0, sticky="nsew", pady=(10, 12))
         self.tree.bind("<<TreeviewSelect>>", self.select_company)
 
-        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=500, justify="left")
+        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=720, justify="left")
         status.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(right, textvariable=self.summary_var, style="Panel.TLabel").grid(row=3, column=0, sticky="w")
 
