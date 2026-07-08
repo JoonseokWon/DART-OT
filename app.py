@@ -442,12 +442,11 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         benchmark_rates = avg_borrowing_rates
         benchmark_label = "평균차입이자율" if avg_borrowing_rates else ""
-        amount_sum = sum(line.max_amount for line in test_lines)
-        max_amount = max((line.max_amount for line in test_lines), default=0)
+        amount_sum, max_amount, amount_method, amount_used_lines = calculate_borrowing_amount(test_lines)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
-        special_bond_lines = [line for line in test_lines if is_special_bond_context(line.context)]
-        special_bond_amount = sum(line.max_amount for line in special_bond_lines)
+        special_bond_lines = [line for line in amount_used_lines if is_special_bond_context(line.context)]
+        special_bond_amount = sum(extract_current_amount(line) or 0 for line in special_bond_lines)
         special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
@@ -492,6 +491,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
+                "amount_method": amount_method,
                 "amount_diff": amount_diff,
                 "amount_change": amount_change,
                 "special_bond_amount": special_bond_amount,
@@ -511,6 +511,131 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         prev_amount_sum = amount_sum
 
     return rows
+
+
+def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, str, list[BorrowingLine]]:
+    candidates: list[tuple[BorrowingLine, int]] = []
+    seen_contexts: set[str] = set()
+    for line in lines:
+        if not is_borrowing_amount_context(line.context):
+            continue
+        amount = extract_current_amount(line)
+        if amount is None or amount <= 0:
+            continue
+        key = normalize_text(line.context)
+        if key in seen_contexts:
+            continue
+        seen_contexts.add(key)
+        candidates.append((line, amount))
+
+    if not candidates:
+        return 0, 0, "차입금 잔액 후보 없음", []
+
+    total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
+    if total_candidates:
+        selected_line, selected_amount = max(total_candidates, key=lambda item: item[1])
+        return selected_amount, selected_amount, "합계/총계 행 우선", [selected_line]
+
+    statement_candidates = [(line, amount) for line, amount in candidates if is_statement_borrowing_row(line)]
+    if statement_candidates:
+        by_category: dict[str, tuple[BorrowingLine, int]] = {}
+        for line, amount in statement_candidates:
+            category = borrowing_amount_category(line.context)
+            if category not in by_category or amount > by_category[category][1]:
+                by_category[category] = (line, amount)
+        selected = list(by_category.values())
+        amount_sum = sum(amount for _, amount in selected)
+        max_amount = max((amount for _, amount in selected), default=0)
+        return amount_sum, max_amount, "재무상태표 차입 항목 우선", [line for line, _ in selected]
+
+    selected: list[tuple[BorrowingLine, int]] = []
+    seen_amount_keys: set[tuple[str, int]] = set()
+    for line, amount in candidates:
+        label = borrowing_line_label(line.context)
+        key = (label, amount)
+        if key in seen_amount_keys:
+            continue
+        seen_amount_keys.add(key)
+        selected.append((line, amount))
+
+    amount_sum = sum(amount for _, amount in selected)
+    max_amount = max((amount for _, amount in selected), default=0)
+    return amount_sum, max_amount, "차입 항목별 당기 금액 합산", [line for line, _ in selected]
+
+
+def extract_current_amount(line: BorrowingLine) -> int | None:
+    values = [abs(value) for value in line.amounts if abs(value) > 0]
+    if not values:
+        return None
+    return values[0]
+
+
+def is_borrowing_amount_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    if not any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "사채", "유동성장기", "금융기관차입", "borrow", "debt", "bond", "loan")):
+        return False
+    if not re.search(r"\d{1,3}(?:,\d{3})+", text):
+        return False
+    exclusion_keywords = (
+        "이자비용",
+        "차입원가",
+        "담보제공",
+        "담보설정",
+        "약정",
+        "한도",
+        "리스부채",
+        "증분차입",
+        "wacc",
+        "가중평균자본비용",
+        "netcash",
+        "유동자금",
+        "자산총액",
+        "자산총계",
+        "유동자산",
+        "비유동자산",
+        "전환가액",
+        "전환권",
+        "주식수",
+        "스톡옵션",
+        "상환",
+    )
+    return not any(keyword in compact for keyword in exclusion_keywords)
+
+
+def is_total_amount_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in ("합계", "총계", "총차입금", "차입금계", "사채계"))
+
+
+def is_statement_borrowing_row(line: BorrowingLine) -> bool:
+    if line.line_no > 2500:
+        return False
+    compact = re.sub(r"\s+", "", line.context)
+    if not any(keyword in compact for keyword in ("단기차입금", "장기차입금", "유동성장기부채", "유동성사채", "사채")):
+        return False
+    return bool(re.search(r"\b\d{1,2}(?:,\s*\d{1,2}){1,8}\b", line.context))
+
+
+def borrowing_amount_category(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    if "단기차입" in compact:
+        return "단기차입금"
+    if "유동성장기" in compact:
+        return "유동성장기부채"
+    if "장기차입" in compact:
+        return "장기차입금"
+    if "유동성사채" in compact:
+        return "유동성사채"
+    if "사채" in compact:
+        return "사채"
+    return borrowing_line_label(text)
+
+
+def borrowing_line_label(text: str) -> str:
+    cleaned = normalize_text(text)
+    cleaned = re.sub(r"\d{1,3}(?:,\d{3})+", "", cleaned)
+    cleaned = re.sub(r"\d{1,2}(?:\.\d{1,4})?\s*%", "", cleaned)
+    return cleaned[:80]
 
 
 def is_wacc_context(text: str) -> bool:
@@ -690,6 +815,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "WACC참고검출수",
                 "검출금액합계",
                 "최대라인금액",
+                "금액산정방식",
                 "금액단위",
                 "전기대비증감",
                 "전기대비변동률",
@@ -718,6 +844,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["wacc_count"],
                     t["amount_sum"],
                     t["max_amount"],
+                    t["amount_method"],
                     t["amount_unit"],
                     t["amount_diff"],
                     t["amount_change"],
@@ -735,7 +862,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 13: 2, 14: 3, 15: 2, 16: 3, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 14: 2, 15: 3, 16: 2, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3, 23: 3},
         ),
     ]
 
