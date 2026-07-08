@@ -570,7 +570,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
             amount_unit = "혼합: " + ", ".join(amount_units)
 
         if avg_benchmark_rate is None:
-            result = "비교불가: 평균 차입이자율 정보 부족"
+            result = "비교불가: 비교기준(평균차입이자율) 정보 부족"
         elif avg_rate is None:
             result = "비교불가: 차입금 이자율 정보 부족"
         elif benchmark_error_rate is not None and abs(benchmark_error_rate) <= 0.05:
@@ -777,7 +777,7 @@ def is_valid_borrowing_rate_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text).lower()
     if not any(keyword in compact for keyword in ("차입금", "사채", "차입", "borrow", "debt", "bond")):
         return False
-    if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "interest", "rate")):
+    if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "interest", "rate")) and not has_rate_pattern(text):
         return False
     excluded = (
         "cashcoverage",
@@ -806,6 +806,12 @@ def is_valid_borrowing_rate_context(text: str) -> bool:
 
 def is_reasonable_interest_rate(rate: float) -> bool:
     return 0 < rate <= 0.30
+
+
+def has_rate_pattern(text: str) -> bool:
+    if re.search(r"(?<![\d.])\d{1,2}(?:\.\d{1,4})?\s*%(?!\d)", text):
+        return True
+    return bool(re.search(r"(?<![\d,])\d{1,2}\.\d{1,4}\s*(?:~|-|∼|～)\s*\d{1,2}\.\d{1,4}(?![\d,])", text))
 
 
 def is_special_bond_context(text: str) -> bool:
@@ -838,7 +844,28 @@ def extract_rate_values(text: str) -> list[float]:
             rates.append(float(raw) / 100)
         except ValueError:
             continue
+    for left, right in re.findall(r"(?<![\d,])(\d{1,2}\.\d{1,4})\s*(?:~|-|∼|～)\s*(\d{1,2}\.\d{1,4})(?![\d,])", text):
+        for raw in (left, right):
+            try:
+                value = float(raw) / 100
+            except ValueError:
+                continue
+            if value not in rates:
+                rates.append(value)
+    if is_decimal_rate_context(text):
+        for raw in re.findall(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if 0 < value <= 0.30 and value not in rates:
+                rates.append(value)
     return rates
+
+
+def is_decimal_rate_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    return any(keyword in compact for keyword in ("이자율", "이율", "금리", "wacc", "자본비용", "자본화이자율", "차입이자율", "차입금리", "interest", "rate"))
 
 
 def extract_amount(text: str) -> float | None:
