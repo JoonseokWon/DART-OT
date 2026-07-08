@@ -704,15 +704,22 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             amount_unit = "혼합: " + ", ".join(amount_units)
 
         if avg_rate is None:
-            result = "검토필요: 차입금 이자율 후보 부족으로 이자비용 기대값 산정 불가"
+            judgment = "판단불가"
+            judgment_basis = "차입금/사채 행에서 이자율 후보가 부족해 예상 이자비용을 산정할 수 없습니다."
         elif actual_interest_expense is None:
-            result = "검토필요: 재무제표 이자비용 계정 미검출로 자동 비교 불가"
+            judgment = "판단불가"
+            judgment_basis = "재무제표 또는 주석에서 비교 가능한 이자비용 계정을 찾지 못했습니다."
         elif not is_exact_interest_expense_account(financial_expense.account_name):
-            result = "검토필요: 이자비용 계정 미분리로 금융비용 대체값 사용. 자동 적정판정 제외"
+            judgment = "판단불가"
+            judgment_basis = "금융비용 대체값은 외환손익 등 다른 항목이 섞일 수 있어 적정 판정에서 제외했습니다."
         elif interest_expense_error_rate is not None and abs(interest_expense_error_rate) <= 0.05:
-            result = "적정: 이자비용 기대값 대비 ±5% 이내"
+            judgment = "적정"
+            judgment_basis = "예상 이자비용과 회사 계상 이자비용의 차이가 ±5% 이내입니다."
         else:
-            result = "확인필요: 이자비용 기대값 대비 오차범위 초과"
+            judgment = "확인필요"
+            judgment_basis = "예상 이자비용과 회사 계상 이자비용의 차이가 ±5%를 초과합니다."
+
+        result = judgment
 
         caution_reasons: list[str] = []
         if amount_change is not None and abs(amount_change) >= 0.30:
@@ -758,6 +765,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "interest_expense_diff": interest_expense_diff,
                 "interest_expense_error_rate": interest_expense_error_rate,
                 "interest_expense_memo": financial_expense.memo,
+                "judgment": judgment,
+                "judgment_basis": judgment_basis,
                 "result": result,
                 "caution_status": caution_status,
                 "caution_reason": caution_reason,
@@ -1253,31 +1262,31 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "보고서명",
                 "접수일",
                 "접수번호",
-                "차입금문맥수",
-                "검출금액합계",
-                "최대라인금액",
-                "금액산정방식",
-                "금액단위",
-                "증감비교대상",
-                "전년동기대비증감",
-                "전년동기대비변동률",
-                "특수사채금액",
-                "특수사채비중",
-                "특수사채검토메모",
-                "최저차입이자율",
-                "평균차입이자율",
-                "최고차입이자율",
-                "평균차입금",
-                "대상기간(개월)",
+                "판정",
+                "판정근거",
+                "이자비용오차율",
                 "예상이자비용",
                 "실제이자비용",
-                "이자비용계정",
                 "이자비용차이",
-                "이자비용오차율",
-                "이자비용산정메모",
-                "결과",
+                "이자비용계정",
+                "평균차입금",
+                "평균차입이자율",
+                "최저차입이자율",
+                "최고차입이자율",
+                "대상기간(개월)",
+                "검출금액합계",
+                "증감비교대상",
+                "전년동기대비변동률",
+                "전년동기대비증감",
+                "특수사채금액",
+                "특수사채비중",
                 "주의여부",
                 "주의사유",
+                "금액단위",
+                "금액산정방식",
+                "차입금문맥수",
+                "이자비용산정메모",
+                "특수사채검토메모",
             ],
             [
                 [
@@ -1285,35 +1294,35 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["report_name"],
                     t["receipt_date"],
                     t["receipt_no"],
-                    t["context_count"],
-                    t["amount_sum"],
-                    t["max_amount"],
-                    t["amount_method"],
-                    t["amount_unit"],
-                    t["amount_comparison_label"],
-                    t["amount_diff"],
-                    t["amount_change"],
-                    t["special_bond_amount"],
-                    t["special_bond_ratio"],
-                    t["special_bond_memo"],
-                    t["min_rate"],
-                    t["avg_rate"],
-                    t["max_rate"],
-                    t["average_borrowing_balance"],
-                    t["period_months"],
+                    t["judgment"],
+                    t["judgment_basis"],
+                    t["interest_expense_error_rate"],
                     t["expected_interest_expense"],
                     t["actual_interest_expense"],
-                    t["interest_expense_account"],
                     t["interest_expense_diff"],
-                    t["interest_expense_error_rate"],
-                    t["interest_expense_memo"],
-                    t["result"],
+                    t["interest_expense_account"],
+                    t["average_borrowing_balance"],
+                    t["avg_rate"],
+                    t["min_rate"],
+                    t["max_rate"],
+                    t["period_months"],
+                    t["amount_sum"],
+                    t["amount_comparison_label"],
+                    t["amount_change"],
+                    t["amount_diff"],
+                    t["special_bond_amount"],
+                    t["special_bond_ratio"],
                     t["caution_status"],
                     t["caution_reason"],
+                    t["amount_unit"],
+                    t["amount_method"],
+                    t["context_count"],
+                    t["interest_expense_memo"],
+                    t["special_bond_memo"],
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 11: 2, 12: 3, 13: 2, 14: 3, 16: 3, 17: 3, 18: 3, 19: 2, 20: 2, 21: 2, 22: 2, 24: 2, 25: 3},
+            {7: 3, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 3, 15: 3, 17: 2, 19: 3, 20: 2, 21: 2, 22: 3, 27: 2},
         ),
     ]
 
