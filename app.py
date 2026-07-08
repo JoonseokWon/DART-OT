@@ -912,7 +912,7 @@ class DartOtApp(tk.Tk):
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
-        self.company_var = tk.StringVar(value="삼성전자")
+        self.company_text: tk.Text | None = None
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 9))
@@ -962,7 +962,7 @@ class DartOtApp(tk.Tk):
 
         self._entry(left, "DART API 키", self.api_key_var, show="*")
         ttk.Checkbutton(left, text="API 키 저장", variable=self.save_api_key_var).pack(anchor="w", pady=(0, 8))
-        self._entry(left, "회사명", self.company_var)
+        self._company_entry(left)
         self._entry(left, "종목코드", self.stock_var)
         self._entry(left, "DART 고유번호", self.corp_code_var)
 
@@ -1019,6 +1019,44 @@ class DartOtApp(tk.Tk):
         )
         entry.pack(fill="x", ipady=5)
 
+    def _company_entry(self, parent) -> None:
+        container = ttk.Frame(parent, style="Panel.TFrame")
+        container.pack(fill="x", pady=(0, 8))
+        ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        self.company_text = tk.Text(
+            container,
+            height=1,
+            width=20,
+            font=self.entry_font,
+            relief="solid",
+            bd=1,
+            highlightthickness=1,
+            highlightbackground="#cbd5e1",
+            highlightcolor="#0f766e",
+            wrap="none",
+            undo=False,
+        )
+        self.company_text.insert("1.0", "삼성전자")
+        self.company_text.pack(fill="x", ipady=3)
+        self.company_text.bind("<Return>", lambda _event: "break")
+        self.company_text.bind("<Tab>", lambda _event: self.focus_next_company_widget())
+
+    def focus_next_company_widget(self):
+        if self.company_text is not None:
+            self.company_text.tk_focusNext().focus()
+        return "break"
+
+    def get_company_name(self) -> str:
+        if self.company_text is None:
+            return ""
+        return self.company_text.get("1.0", "end-1c").strip()
+
+    def set_company_name(self, value: str) -> None:
+        if self.company_text is None:
+            return
+        self.company_text.delete("1.0", "end")
+        self.company_text.insert("1.0", value)
+
     def search_company(self) -> None:
         api_key = self.api_key_var.get().strip()
         if not api_key:
@@ -1027,7 +1065,7 @@ class DartOtApp(tk.Tk):
 
         self.selected_corp = None
         self.corp_code_var.set("")
-        if self.company_var.get().strip():
+        if self.get_company_name():
             self.stock_var.set("")
         self.persist_api_key()
         self.status_var.set("회사 목록을 조회하고 있습니다.")
@@ -1037,7 +1075,7 @@ class DartOtApp(tk.Tk):
     def _search_company_worker(self, api_key: str) -> None:
         try:
             client = DartClient(api_key)
-            results = client.search_corps(self.company_var.get(), self.stock_var.get())
+            results = client.search_corps(self.get_company_name(), self.stock_var.get())
             self.after(0, lambda: self._show_search_results(results))
         except Exception as exc:
             self.after(0, lambda: self._show_error(f"회사 검색 중 오류가 발생했습니다: {exc}"))
@@ -1065,7 +1103,7 @@ class DartOtApp(tk.Tk):
             return
         index = int(selected[0])
         self.selected_corp = self.search_results[index]
-        self.company_var.set(self.selected_corp.corp_name)
+        self.set_company_name(self.selected_corp.corp_name)
         self.stock_var.set(self.selected_corp.stock_code)
         self.corp_code_var.set(self.selected_corp.corp_code)
 
@@ -1074,7 +1112,7 @@ class DartOtApp(tk.Tk):
         if not api_key:
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
             return
-        if self.selected_corp is not None and self.company_var.get().strip() != self.selected_corp.corp_name:
+        if self.selected_corp is not None and self.get_company_name() != self.selected_corp.corp_name:
             self.selected_corp = None
             self.corp_code_var.set("")
         if self.selected_corp is None and not self.corp_code_var.get().strip():
@@ -1098,7 +1136,7 @@ class DartOtApp(tk.Tk):
     def _run_export_worker(self) -> None:
         payload = {
             "apiKey": self.api_key_var.get(),
-            "companyName": self.company_var.get(),
+            "companyName": self.get_company_name(),
             "stockCode": self.stock_var.get(),
             "corpCode": self.corp_code_var.get(),
             "beginYear": self.begin_year_var.get(),
