@@ -485,7 +485,7 @@ def is_financial_borrowing_account(account: str) -> bool:
 
 def is_exact_interest_expense_account(account: str) -> bool:
     compact = re.sub(r"\s+", "", account)
-    return compact in {"이자비용", "차입금이자비용", "사채이자비용"}
+    return compact in {"이자비용", "차입금이자비용", "사채이자비용"} or "상각후원가측정금융부채이자비용" in compact
 
 
 def is_finance_cost_account(account: str) -> bool:
@@ -632,7 +632,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None else amount_sum
         period_factor = report_period_months(report) / 12
         expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
-        financial_expense = financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
+        financial_expense = extract_note_interest_expense(report_lines) or financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
         actual_interest_expense = financial_expense.actual_interest_expense
         interest_expense_diff = actual_interest_expense - expected_interest_expense if actual_interest_expense is not None and expected_interest_expense is not None else None
         interest_expense_error_rate = interest_expense_diff / expected_interest_expense if interest_expense_diff is not None and expected_interest_expense not in (None, 0) else None
@@ -761,6 +761,24 @@ def extract_current_amount(line: BorrowingLine) -> int | None:
     if not values:
         return None
     return values[0]
+
+
+def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpense | None:
+    candidates: list[int] = []
+    for line in lines:
+        compact = re.sub(r"\s+", "", line.context)
+        if "상각후원가측정금융부채이자비용" not in compact:
+            continue
+        if "기타금융부채이자비용" in compact or "리스부채" in compact:
+            continue
+        amount = extract_current_amount(line)
+        if amount is not None and amount > 0:
+            candidates.append(amount)
+    if not candidates:
+        return None
+    amount = max(candidates)
+    receipt_no = lines[0].receipt_no if lines else ""
+    return FinancialExpense(receipt_no, amount, "상각후원가 측정 금융부채 이자비용", "주석 금융원가 표의 차입 관련 이자비용 사용")
 
 
 def is_borrowing_amount_context(text: str) -> bool:
