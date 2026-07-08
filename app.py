@@ -558,9 +558,11 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         amount_sum, max_amount, amount_method, amount_used_lines = calculate_borrowing_amount(test_lines)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
-        special_bond_lines = [line for line in amount_used_lines if is_special_bond_context(line.context)]
+        special_bond_mention_count = sum(1 for line in test_lines if is_special_bond_context(line.context))
+        special_bond_lines = [line for line in test_lines if is_special_bond_amount_context(line.context)]
         special_bond_amount = sum(extract_current_amount(line) or 0 for line in special_bond_lines)
         special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
+        special_bond_memo = special_bond_review_memo(special_bond_mention_count, special_bond_amount)
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
@@ -612,6 +614,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "amount_change": amount_change,
                 "special_bond_amount": special_bond_amount,
                 "special_bond_ratio": special_bond_ratio,
+                "special_bond_memo": special_bond_memo,
                 "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
@@ -840,6 +843,35 @@ def is_special_bond_context(text: str) -> bool:
     )
 
 
+def is_special_bond_amount_context(text: str) -> bool:
+    if not is_special_bond_context(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if not re.search(r"\d{1,3}(?:,\d{3})+", text):
+        return False
+    exclusions = (
+        "미상환전환사채발행현황",
+        "미상환신주인수권부사채",
+        "삽입",
+        ".dsl",
+        "표시되어야할권리",
+        "정기주주총회",
+        "전환가액",
+        "전환권",
+        "주식수",
+        "스톡옵션",
+    )
+    return not any(keyword in compact for keyword in exclusions)
+
+
+def special_bond_review_memo(mention_count: int, amount: int) -> str:
+    if amount > 0:
+        return "전환사채/신주인수권부사채 등 특수사채 금액 후보 검출"
+    if mention_count > 0:
+        return "특수사채 관련 표제목/정관 문구는 검출되었으나 잔액 후보 없음"
+    return "특수사채 관련 문구 없음"
+
+
 def extract_rate(text: str) -> float | None:
     rates = [float(x) for x in re.findall(r"(\d{1,2}(?:\.\d{1,4})?)\s*%", text)]
     return sum(rates) / len(rates) if rates else None
@@ -964,6 +996,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "전기대비변동률",
                 "특수사채금액",
                 "특수사채비중",
+                "특수사채검토메모",
                 "최저차입이자율",
                 "평균차입이자율",
                 "최고차입이자율",
@@ -993,6 +1026,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["amount_change"],
                     t["special_bond_amount"],
                     t["special_bond_ratio"],
+                    t["special_bond_memo"],
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
@@ -1005,7 +1039,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 14: 2, 15: 3, 16: 2, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3, 23: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 14: 2, 15: 3, 16: 2, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3, 23: 3, 24: 3},
         ),
     ]
 
