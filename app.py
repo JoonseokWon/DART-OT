@@ -444,6 +444,9 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         max_amount = max((line.max_amount for line in test_lines), default=0)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
+        special_bond_lines = [line for line in test_lines if is_special_bond_context(line.context)]
+        special_bond_amount = sum(line.max_amount for line in special_bond_lines)
+        special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
@@ -466,6 +469,14 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         else:
             result = "확인필요: 비교 기준 대비 오차범위 초과"
 
+        caution_reasons: list[str] = []
+        if amount_change is not None and abs(amount_change) >= 0.30:
+            caution_reasons.append(f"전기 대비 검출금액합계가 {amount_change:.2%} 변동하여 30% 기준을 초과했습니다.")
+        if special_bond_ratio is not None and special_bond_ratio > 0.30:
+            caution_reasons.append(f"전환사채/신주인수권부사채 등 특수사채 비중이 {special_bond_ratio:.2%}로 30%를 초과했습니다.")
+        caution_status = "주의요망" if caution_reasons else ""
+        caution_reason = " ".join(caution_reasons)
+
         rows.append(
             {
                 "corp_name": report.corp_name,
@@ -480,6 +491,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "max_amount": max_amount,
                 "amount_diff": amount_diff,
                 "amount_change": amount_change,
+                "special_bond_amount": special_bond_amount,
+                "special_bond_ratio": special_bond_ratio,
                 "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
@@ -488,6 +501,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "benchmark_diff": benchmark_diff,
                 "benchmark_error_rate": benchmark_error_rate,
                 "result": result,
+                "caution_status": caution_status,
+                "caution_reason": caution_reason,
             }
         )
         prev_amount_sum = amount_sum
@@ -520,6 +535,24 @@ def is_comparison_rate_context(text: str) -> bool:
 
 def is_borrowing_target_context(text: str) -> bool:
     return any(keyword in text for keyword in ("차입금", "사채", "금융부채", "담보제공"))
+
+
+def is_special_bond_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(
+        keyword in compact
+        for keyword in (
+            "전환사채",
+            "전환상환우선",
+            "신주인수권부사채",
+            "신주인수권",
+            "교환사채",
+            "교환권",
+            "CB",
+            "BW",
+            "EB",
+        )
+    )
 
 
 def extract_rate(text: str) -> float | None:
@@ -621,6 +654,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "금액단위",
                 "전기대비증감",
                 "전기대비변동률",
+                "특수사채금액",
+                "특수사채비중",
                 "최저차입이자율",
                 "평균차입이자율",
                 "최고차입이자율",
@@ -628,6 +663,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "비교기준대비차이",
                 "비교기준대비오차율",
                 "결과",
+                "주의여부",
+                "주의사유",
             ],
             [
                 [
@@ -644,6 +681,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["amount_unit"],
                     t["amount_diff"],
                     t["amount_change"],
+                    t["special_bond_amount"],
+                    t["special_bond_ratio"],
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
@@ -651,10 +690,12 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["benchmark_diff"],
                     t["benchmark_error_rate"],
                     t["result"],
+                    t["caution_status"],
+                    t["caution_reason"],
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3, 19: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 2, 15: 3, 16: 3, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3},
         ),
     ]
 
@@ -671,7 +712,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
 def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 16, 16, 14, 14, 16, 34]
+    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 16, 16, 16, 16, 14, 14, 16, 34, 12, 80]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
