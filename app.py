@@ -430,35 +430,41 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
     prev_amount_sum: int | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
         report_lines = by_receipt.get(report.receipt_no, [])
-        borrowing_rate_lines = [line for line in report_lines if not is_wacc_context(line.context)]
-        wacc_lines = [line for line in report_lines if is_wacc_context(line.context)]
-        rates = [rate for line in borrowing_rate_lines for rate in line.interest_rates]
+        comparison_rate_lines = [line for line in report_lines if is_comparison_rate_context(line.context)]
+        test_lines = [line for line in report_lines if not is_comparison_rate_context(line.context)]
+        target_rate_lines = [line for line in test_lines if is_borrowing_target_context(line.context)]
+        avg_borrowing_rate_lines = [line for line in comparison_rate_lines if is_average_borrowing_rate_context(line.context)]
+        wacc_lines = [line for line in comparison_rate_lines if is_wacc_context(line.context)]
+        rates = [rate for line in target_rate_lines for rate in line.interest_rates]
+        avg_borrowing_rates = [rate for line in avg_borrowing_rate_lines for rate in line.interest_rates]
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
-        amount_sum = sum(line.max_amount for line in report_lines)
-        max_amount = max((line.max_amount for line in report_lines), default=0)
+        benchmark_rates = avg_borrowing_rates if avg_borrowing_rates else wacc_rates
+        benchmark_label = "평균차입이자율" if avg_borrowing_rates else "WACC"
+        amount_sum = sum(line.max_amount for line in test_lines)
+        max_amount = max((line.max_amount for line in test_lines), default=0)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
         amount_change = amount_diff / prev_amount_sum if amount_diff is not None and prev_amount_sum not in (None, 0) else None
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
-        avg_wacc = sum(wacc_rates) / len(wacc_rates) if wacc_rates else None
-        wacc_diff = avg_rate - avg_wacc if avg_rate is not None and avg_wacc is not None else None
-        wacc_error_rate = wacc_diff / avg_wacc if wacc_diff is not None and avg_wacc not in (None, 0) else None
-        amount_units = sorted({line.amount_unit for line in report_lines if line.max_amount and line.amount_unit})
+        avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
+        benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
+        benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
+        amount_units = sorted({line.amount_unit for line in test_lines if line.max_amount and line.amount_unit})
         amount_unit = ""
         if len(amount_units) == 1:
             amount_unit = amount_units[0]
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        if avg_wacc is None:
-            result = "확인필요: WACC 정보 부족"
+        if avg_benchmark_rate is None:
+            result = "확인필요: 비교 기준 이자율 정보 부족"
         elif avg_rate is None:
             result = "확인필요: 차입금 이자율 정보 부족"
-        elif wacc_error_rate is not None and abs(wacc_error_rate) <= 0.05:
-            result = "적정: WACC 대비 ±5% 이내"
+        elif benchmark_error_rate is not None and abs(benchmark_error_rate) <= 0.05:
+            result = "적정: 비교 기준 대비 ±5% 이내"
         else:
-            result = "확인필요: WACC 대비 오차범위 초과"
+            result = "확인필요: 비교 기준 대비 오차범위 초과"
 
         rows.append(
             {
@@ -466,9 +472,10 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "report_name": report.report_name,
                 "receipt_date": report.receipt_date,
                 "receipt_no": report.receipt_no,
-                "context_count": len(report_lines),
+                "context_count": len(test_lines),
                 "rate_count": len(rates),
-                "wacc_count": len(wacc_rates),
+                "benchmark_type": benchmark_label if benchmark_rates else "",
+                "benchmark_count": len(benchmark_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
                 "amount_diff": amount_diff,
@@ -477,9 +484,9 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
                 "max_rate": max_rate,
-                "avg_wacc": avg_wacc,
-                "wacc_diff": wacc_diff,
-                "wacc_error_rate": wacc_error_rate,
+                "avg_benchmark_rate": avg_benchmark_rate,
+                "benchmark_diff": benchmark_diff,
+                "benchmark_error_rate": benchmark_error_rate,
                 "result": result,
             }
         )
@@ -491,6 +498,28 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
 def is_wacc_context(text: str) -> bool:
     upper_text = text.upper()
     return "WACC" in upper_text or "가중평균자본비용" in text or "가중평균 자본비용" in text
+
+
+def is_average_borrowing_rate_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return (
+        "자본비용" not in compact
+        and (
+            "평균차입이자율" in compact
+            or "평균차입금리" in compact
+            or "가중평균이자율" in compact
+            or "가중평균금리" in compact
+            or ("평균" in compact and ("차입" in compact or "사채" in compact) and ("이자율" in compact or "금리" in compact))
+        )
+    )
+
+
+def is_comparison_rate_context(text: str) -> bool:
+    return is_wacc_context(text) or is_average_borrowing_rate_context(text)
+
+
+def is_borrowing_target_context(text: str) -> bool:
+    return any(keyword in text for keyword in ("차입금", "사채", "금융부채", "담보제공"))
 
 
 def extract_rate(text: str) -> float | None:
@@ -585,7 +614,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "접수번호",
                 "차입금문맥수",
                 "차입금이자율검출수",
-                "WACC검출수",
+                "비교기준",
+                "비교기준이자율검출수",
                 "검출금액합계",
                 "최대라인금액",
                 "금액단위",
@@ -594,9 +624,9 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "최저차입이자율",
                 "평균차입이자율",
                 "최고차입이자율",
-                "평균WACC",
-                "WACC대비차이",
-                "WACC대비오차율",
+                "평균비교기준이자율",
+                "비교기준대비차이",
+                "비교기준대비오차율",
                 "결과",
             ],
             [
@@ -607,7 +637,8 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["receipt_no"],
                     t["context_count"],
                     t["rate_count"],
-                    t["wacc_count"],
+                    t["benchmark_type"],
+                    t["benchmark_count"],
                     t["amount_sum"],
                     t["max_amount"],
                     t["amount_unit"],
@@ -616,14 +647,14 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["min_rate"],
                     t["avg_rate"],
                     t["max_rate"],
-                    t["avg_wacc"],
-                    t["wacc_diff"],
-                    t["wacc_error_rate"],
+                    t["avg_benchmark_rate"],
+                    t["benchmark_diff"],
+                    t["benchmark_error_rate"],
                     t["result"],
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 11: 2, 12: 3, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 3, 15: 3, 16: 3, 17: 3, 18: 3, 19: 3},
         ),
     ]
 
