@@ -73,6 +73,14 @@ class BorrowingLine:
 
 
 @dataclass
+class FinancialExpense:
+    receipt_no: str
+    actual_interest_expense: int | None
+    account_name: str
+    memo: str
+
+
+@dataclass
 class InterestTest:
     corp_name: str
     report_name: str
@@ -174,13 +182,11 @@ class DartClient:
                 )
         return sorted(reports, key=lambda r: (r.receipt_date, r.report_name), reverse=True)
 
-    def extract_financial_borrowing_line(self, corp_code: str, report: DartReport) -> BorrowingLine | None:
+    def get_financial_statement_rows(self, corp_code: str, report: DartReport) -> list[dict]:
         bsns_year = report_business_year(report)
         reprt_code = report_code(report)
         if not bsns_year or not reprt_code:
-            return None
-
-        rows: list[dict] = []
+            return []
         for fs_div in ("CFS", "OFS"):
             data = self._get_json(
                 "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json",
@@ -193,8 +199,11 @@ class DartClient:
                 },
             )
             if data.get("status") == "000" and data.get("list"):
-                rows = data.get("list", [])
-                break
+                return data.get("list", [])
+        return []
+
+    def extract_financial_borrowing_line(self, corp_code: str, report: DartReport) -> BorrowingLine | None:
+        rows = self.get_financial_statement_rows(corp_code, report)
 
         selected: list[tuple[str, int]] = []
         for row in rows:
@@ -228,6 +237,30 @@ class DartClient:
             0,
             context,
         )
+
+    def extract_financial_expense(self, corp_code: str, report: DartReport) -> FinancialExpense:
+        rows = self.get_financial_statement_rows(corp_code, report)
+        exact_interest: list[tuple[str, int]] = []
+        finance_costs: list[tuple[str, int]] = []
+        for row in rows:
+            if row.get("sj_nm") not in ("손익계산서", "포괄손익계산서"):
+                continue
+            account = normalize_text(row.get("account_nm", ""))
+            amount = parse_dart_amount(row.get("thstrm_amount", ""))
+            if amount is None or amount <= 0:
+                continue
+            if is_exact_interest_expense_account(account):
+                exact_interest.append((account, amount // 1_000_000))
+            elif is_finance_cost_account(account):
+                finance_costs.append((account, amount // 1_000_000))
+
+        if exact_interest:
+            account, amount = max(exact_interest, key=lambda item: item[1])
+            return FinancialExpense(report.receipt_no, amount, account, "재무제표 이자비용 계정 사용")
+        if finance_costs:
+            account, amount = max(finance_costs, key=lambda item: item[1])
+            return FinancialExpense(report.receipt_no, amount, account, "이자비용 계정 미분리: 금융비용 계정 사용")
+        return FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용/금융비용 계정 미검출")
 
     def extract_borrowing_note(self, report: DartReport) -> BorrowingNote | None:
         files = self.get_document_texts(report.receipt_no)
@@ -323,6 +356,7 @@ def run_report(payload: dict) -> dict:
 
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
     borrowing_lines: list[BorrowingLine] = []
+    financial_expenses: dict[str, FinancialExpense] = {}
     for report in reports:
         try:
             financial_line = client.extract_financial_borrowing_line(corp.corp_code, report)
@@ -331,11 +365,15 @@ def run_report(payload: dict) -> dict:
         except Exception:
             pass
         try:
+            financial_expenses[report.receipt_no] = client.extract_financial_expense(corp.corp_code, report)
+        except Exception:
+            financial_expenses[report.receipt_no] = FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 조회 실패")
+        try:
             borrowing_lines.extend(client.extract_borrowing_lines(report))
         except Exception:
             continue
 
-    tests = build_overall_tests(reports, borrowing_lines)
+    tests = build_overall_tests(reports, borrowing_lines, financial_expenses)
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests)
@@ -407,6 +445,17 @@ def report_code(report: DartReport) -> str:
     return ""
 
 
+def report_period_months(report: DartReport) -> int:
+    name = report.report_name
+    if "분기보고서" in name and ".03" in name:
+        return 3
+    if "반기보고서" in name:
+        return 6
+    if "분기보고서" in name and ".09" in name:
+        return 9
+    return 12
+
+
 def parse_dart_amount(value: str) -> int | None:
     cleaned = str(value or "").replace(",", "").strip()
     if not cleaned or cleaned == "-":
@@ -432,6 +481,16 @@ def is_financial_borrowing_account(account: str) -> bool:
     if any(excluded in compact for excluded in ("리스", "이자", "파생", "충당", "순확정")):
         return False
     return compact.endswith("차입금") or compact.endswith("사채")
+
+
+def is_exact_interest_expense_account(account: str) -> bool:
+    compact = re.sub(r"\s+", "", account)
+    return compact in {"이자비용", "차입금이자비용", "사채이자비용"}
+
+
+def is_finance_cost_account(account: str) -> bool:
+    compact = re.sub(r"\s+", "", account)
+    return compact in {"금융비용", "금융원가"} or compact.endswith("금융비용")
 
 
 def clean_context(value: str) -> str:
@@ -531,7 +590,8 @@ def interest_test_from_note(note: BorrowingNote) -> InterestTest:
     return InterestTest(note.corp_name, note.report_name, note.receipt_no, amount, rate, expected, actual, error, result)
 
 
-def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -> list[dict]:
+def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], financial_expenses: dict[str, FinancialExpense] | None = None) -> list[dict]:
+    financial_expenses = financial_expenses or {}
     by_receipt: dict[str, list[BorrowingLine]] = {}
     for line in lines:
         by_receipt.setdefault(line.receipt_no, []).append(line)
@@ -569,6 +629,13 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
+        average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None else amount_sum
+        period_factor = report_period_months(report) / 12
+        expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
+        financial_expense = financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
+        actual_interest_expense = financial_expense.actual_interest_expense
+        interest_expense_diff = actual_interest_expense - expected_interest_expense if actual_interest_expense is not None and expected_interest_expense is not None else None
+        interest_expense_error_rate = interest_expense_diff / expected_interest_expense if interest_expense_diff is not None and expected_interest_expense not in (None, 0) else None
         amount_units = sorted({line.amount_unit for line in amount_used_lines if line.max_amount and line.amount_unit})
         amount_unit = ""
         if len(amount_units) == 1:
@@ -576,17 +643,16 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        if avg_benchmark_rate is None:
-            if wacc_rates:
-                result = "검토필요: 평균차입이자율 미공시. WACC는 참고검출만 가능하여 자동 비교 제외"
-            else:
-                result = "검토필요: 평균차입이자율 미공시로 자동 비교 불가"
-        elif avg_rate is None:
-            result = "비교불가: 차입금 이자율 정보 부족"
-        elif benchmark_error_rate is not None and abs(benchmark_error_rate) <= 0.05:
-            result = "적정: 비교 기준 대비 ±5% 이내"
+        if avg_rate is None:
+            result = "검토필요: 차입금 이자율 후보 부족으로 이자비용 기대값 산정 불가"
+        elif actual_interest_expense is None:
+            result = "검토필요: 재무제표 이자비용 계정 미검출로 자동 비교 불가"
+        elif not is_exact_interest_expense_account(financial_expense.account_name):
+            result = "검토필요: 이자비용 계정 미분리로 금융비용 대체값 사용. 자동 적정판정 제외"
+        elif interest_expense_error_rate is not None and abs(interest_expense_error_rate) <= 0.05:
+            result = "적정: 이자비용 기대값 대비 ±5% 이내"
         else:
-            result = "확인필요: 비교 기준 대비 오차범위 초과"
+            result = "확인필요: 이자비용 기대값 대비 오차범위 초과"
 
         caution_reasons: list[str] = []
         if amount_change is not None and abs(amount_change) >= 0.30:
@@ -622,6 +688,14 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "avg_benchmark_rate": avg_benchmark_rate,
                 "benchmark_diff": benchmark_diff,
                 "benchmark_error_rate": benchmark_error_rate,
+                "average_borrowing_balance": average_borrowing_balance,
+                "period_factor": period_factor,
+                "expected_interest_expense": expected_interest_expense,
+                "actual_interest_expense": actual_interest_expense,
+                "interest_expense_account": financial_expense.account_name,
+                "interest_expense_diff": interest_expense_diff,
+                "interest_expense_error_rate": interest_expense_error_rate,
+                "interest_expense_memo": financial_expense.memo,
                 "result": result,
                 "caution_status": caution_status,
                 "caution_reason": caution_reason,
@@ -1003,6 +1077,14 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "평균비교기준이자율",
                 "비교기준대비차이",
                 "비교기준대비오차율",
+                "평균차입금",
+                "기간계수",
+                "예상이자비용",
+                "실제이자비용",
+                "이자비용계정",
+                "이자비용차이",
+                "이자비용오차율",
+                "이자비용산정메모",
                 "결과",
                 "주의여부",
                 "주의사유",
@@ -1033,13 +1115,21 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["avg_benchmark_rate"],
                     t["benchmark_diff"],
                     t["benchmark_error_rate"],
+                    t["average_borrowing_balance"],
+                    t["period_factor"],
+                    t["expected_interest_expense"],
+                    t["actual_interest_expense"],
+                    t["interest_expense_account"],
+                    t["interest_expense_diff"],
+                    t["interest_expense_error_rate"],
+                    t["interest_expense_memo"],
                     t["result"],
                     t["caution_status"],
                     t["caution_reason"],
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 14: 2, 15: 3, 16: 2, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3, 23: 3, 24: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 14: 2, 15: 3, 16: 2, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3, 23: 3, 24: 2, 25: 3, 26: 2, 27: 2, 29: 2, 30: 3},
         ),
     ]
 
