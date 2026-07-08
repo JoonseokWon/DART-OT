@@ -438,8 +438,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         rates = [rate for line in target_rate_lines for rate in line.interest_rates]
         avg_borrowing_rates = [rate for line in avg_borrowing_rate_lines for rate in line.interest_rates]
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
-        benchmark_rates = avg_borrowing_rates if avg_borrowing_rates else wacc_rates
-        benchmark_label = "평균차입이자율" if avg_borrowing_rates else "WACC"
+        benchmark_rates = avg_borrowing_rates
+        benchmark_label = "평균차입이자율" if avg_borrowing_rates else ""
         amount_sum = sum(line.max_amount for line in test_lines)
         max_amount = max((line.max_amount for line in test_lines), default=0)
         amount_diff = amount_sum - prev_amount_sum if prev_amount_sum is not None else None
@@ -461,9 +461,9 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
             amount_unit = "혼합: " + ", ".join(amount_units)
 
         if avg_benchmark_rate is None:
-            result = "확인필요: 비교 기준 이자율 정보 부족"
+            result = "비교불가: 평균 차입이자율 정보 부족"
         elif avg_rate is None:
-            result = "확인필요: 차입금 이자율 정보 부족"
+            result = "비교불가: 차입금 이자율 정보 부족"
         elif benchmark_error_rate is not None and abs(benchmark_error_rate) <= 0.05:
             result = "적정: 비교 기준 대비 ±5% 이내"
         else:
@@ -487,6 +487,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
                 "rate_count": len(rates),
                 "benchmark_type": benchmark_label if benchmark_rates else "",
                 "benchmark_count": len(benchmark_rates),
+                "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
                 "amount_diff": amount_diff,
@@ -649,6 +650,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "차입금이자율검출수",
                 "비교기준",
                 "비교기준이자율검출수",
+                "WACC참고검출수",
                 "검출금액합계",
                 "최대라인금액",
                 "금액단위",
@@ -676,6 +678,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["rate_count"],
                     t["benchmark_type"],
                     t["benchmark_count"],
+                    t["wacc_count"],
                     t["amount_sum"],
                     t["max_amount"],
                     t["amount_unit"],
@@ -695,7 +698,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 2, 15: 3, 16: 3, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3},
+            {5: 2, 6: 2, 8: 2, 9: 2, 10: 2, 11: 2, 13: 2, 14: 3, 15: 2, 16: 3, 17: 3, 18: 3, 19: 3, 20: 3, 21: 3, 22: 3},
         ),
     ]
 
@@ -712,7 +715,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
 def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
-    widths = [16, 28, 12, 16, 14, 18, 14, 16, 16, 12, 16, 16, 16, 16, 16, 16, 16, 14, 14, 16, 34, 12, 80]
+    widths = [16, 28, 12, 16, 14, 18, 14, 18, 16, 16, 16, 12, 16, 16, 16, 16, 16, 16, 16, 16, 14, 16, 34, 12, 80]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
