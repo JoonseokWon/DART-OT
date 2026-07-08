@@ -2,5 +2,6 @@ bin/
 obj/
 outputs/
 .dart_ot_config.json
+.dart_corp_cache.json
 *.user
 *.suo

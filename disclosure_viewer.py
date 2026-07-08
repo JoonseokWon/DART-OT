@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+from datetime import datetime
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -18,6 +19,10 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
+CORP_CACHE_PATH = ROOT / ".dart_corp_cache.json"
+DOCUMENT_PREVIEW_CHARS = 220_000
+_CORP_CODES: list["CorpInfo"] | None = None
+_DOCUMENT_FILES: dict[str, list[tuple[str, str]]] = {}
 
 
 @dataclass
@@ -164,15 +169,24 @@ class DartDocumentRenderer(HTMLParser):
         self.handle_data(html.unescape(f"&#{name};"))
 
 
-def render_dart_document_html(files: list[tuple[str, str]], keyword: str = "") -> str:
+def render_dart_document_html(files: list[tuple[str, str]], keyword: str = "", max_chars: int | None = None) -> str:
     rendered: list[str] = []
+    remaining = max_chars
     for source, text in files:
+        truncated = False
+        if remaining is not None:
+            if remaining <= 0:
+                break
+            truncated = len(text) > remaining
+            text = text[:remaining]
+            remaining -= len(text)
         body = DartDocumentRenderer(keyword).render(text)
         if body:
+            notice = '<div class="preview-notice">빠른 미리보기입니다. 필요한 경우 상단의 전체 원문 버튼을 눌러 전체 내용을 불러오세요.</div>' if truncated else ""
             rendered.append(
                 f'<article class="dart-document">'
                 f'<div class="source-name">{html.escape(source)}</div>'
-                f"{body}</article>"
+                f"{notice}{body}</article>"
             )
     return "".join(rendered)
 
@@ -219,6 +233,19 @@ class DartClient:
         return [{"corpCode": c.corp_code, "corpName": c.corp_name, "stockCode": c.stock_code} for c in matches[:limit]]
 
     def get_corp_codes(self) -> list[CorpInfo]:
+        global _CORP_CODES
+        if _CORP_CODES is not None:
+            return _CORP_CODES
+        today = datetime.now().strftime("%Y%m%d")
+        if CORP_CACHE_PATH.exists():
+            try:
+                cached = json.loads(CORP_CACHE_PATH.read_text(encoding="utf-8"))
+                if cached.get("date") == today and cached.get("items"):
+                    _CORP_CODES = [CorpInfo(item["corp_code"], item["corp_name"], item.get("stock_code", "")) for item in cached["items"]]
+                    return _CORP_CODES
+            except Exception:
+                pass
+
         data = self._get_bytes("https://opendart.fss.or.kr/api/corpCode.xml", {"crtfc_key": self.api_key})
         with zipfile.ZipFile(BytesIO(data)) as archive:
             name = next(n for n in archive.namelist() if n.lower().endswith(".xml"))
@@ -228,7 +255,21 @@ class DartClient:
             corp_code = text_of(node, "corp_code")
             if corp_code:
                 corps.append(CorpInfo(corp_code, text_of(node, "corp_name"), text_of(node, "stock_code")))
-        return corps
+        _CORP_CODES = corps
+        try:
+            CORP_CACHE_PATH.write_text(
+                json.dumps(
+                    {
+                        "date": today,
+                        "items": [{"corp_code": c.corp_code, "corp_name": c.corp_name, "stock_code": c.stock_code} for c in corps],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        return _CORP_CODES
 
     def get_disclosures(self, corp_code: str, begin_date: str, end_date: str, pblntf_ty: str = "") -> list[dict]:
         rows: list[dict] = []
@@ -270,6 +311,8 @@ class DartClient:
         return sorted(rows, key=lambda r: (r["receiptDate"], r["receiptNo"]), reverse=True)
 
     def get_document_files(self, receipt_no: str) -> list[tuple[str, str]]:
+        if receipt_no in _DOCUMENT_FILES:
+            return _DOCUMENT_FILES[receipt_no]
         data = self._get_bytes("https://opendart.fss.or.kr/api/document.xml", {"crtfc_key": self.api_key, "rcept_no": receipt_no})
         files: list[tuple[str, str]] = []
         try:
@@ -279,16 +322,24 @@ class DartClient:
                         files.append((Path(name).name, decode_dart_document(archive.read(name))))
         except zipfile.BadZipFile:
             files.append((f"{receipt_no}.xml", decode_dart_document(data)))
+        _DOCUMENT_FILES[receipt_no] = files
         return files
 
-    def get_document_html(self, receipt_no: str, keyword: str = "") -> dict:
+    def get_document_html(self, receipt_no: str, keyword: str = "", full: bool = False) -> dict:
         files = self.get_document_files(receipt_no)
-        rendered = render_dart_document_html(files, keyword)
+        rendered = render_dart_document_html(files, keyword, None if full else DOCUMENT_PREVIEW_CHARS)
         keyword_count = 0
         if keyword.strip():
             needle = re.compile(re.escape(keyword.strip()), re.IGNORECASE)
             keyword_count = sum(len(needle.findall(clean_text(text))) for _, text in files)
-        return {"html": rendered, "fileCount": len(files), "keywordCount": keyword_count}
+        total_chars = sum(len(text) for _, text in files)
+        return {
+            "html": rendered,
+            "fileCount": len(files),
+            "keywordCount": keyword_count,
+            "preview": not full and total_chars > DOCUMENT_PREVIEW_CHARS,
+            "totalChars": total_chars,
+        }
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
         return json.loads(self._get_bytes(url, params).decode("utf-8", errors="ignore"))
@@ -318,11 +369,12 @@ class Handler(BaseHTTPRequestHandler):
             api_key = query.get("apiKey", [""])[0] or load_config().get("api_key", "")
             receipt_no = query.get("receiptNo", [""])[0]
             keyword = query.get("keyword", [""])[0]
+            full = query.get("full", ["0"])[0] == "1"
             if not api_key or not receipt_no:
                 self.json({"ok": False, "message": "API 키와 접수번호가 필요합니다."})
                 return
             try:
-                document = DartClient(api_key).get_document_html(receipt_no, keyword)
+                document = DartClient(api_key).get_document_html(receipt_no, keyword, full)
                 self.json({"ok": True, **document})
             except Exception as exc:
                 self.json({"ok": False, "message": str(exc)})
@@ -433,6 +485,7 @@ HTML_PAGE = r"""
     .dart-table th, .dart-table td { border:1px solid #9ca3af; padding:6px 8px; vertical-align:top; white-space:pre-wrap; }
     .dart-table th { position:static; background:#f3f4f6; font-weight:800; }
     .dart-document mark { background:#fff3a3; padding:0 2px; }
+    .preview-notice { margin:0 0 14px; padding:10px 12px; border:1px solid #f3c96b; background:#fff8e1; color:#694a05; border-radius:6px; font-weight:700; }
     .viewer-tools { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
     .viewer-tools input { max-width:260px; }
     @media (max-width:900px) { main { grid-template-columns:1fr; height:auto; } }
@@ -490,6 +543,7 @@ HTML_PAGE = r"""
         <div class="viewer-tools">
           <input id="docKeyword" placeholder="원문 내 검색어 예: 차입금">
           <button id="reloadDoc">원문 검색</button>
+          <button id="loadFullDoc" class="light">전체 원문</button>
           <a id="dartLink" target="_blank"></a>
         </div>
         <div class="doc" id="docRecords"></div>
@@ -579,18 +633,22 @@ HTML_PAGE = r"""
           <div>${r.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</div>
         </div>`).join("") || "표시할 원문이 없습니다. 검색어를 바꿔보세요.";
     }
-    reloadDoc = async function() {
+    reloadDoc = async function(full = false) {
       if (!selectedReceiptNo) return;
-      $("docRecords").innerHTML = "원문을 불러오는 중입니다.";
-      const q = new URLSearchParams({ apiKey:$("apiKey").value, receiptNo:selectedReceiptNo, keyword:$("docKeyword").value });
+      $("docRecords").innerHTML = full ? "전체 원문을 불러오는 중입니다." : "빠른 미리보기를 불러오는 중입니다.";
+      const q = new URLSearchParams({ apiKey:$("apiKey").value, receiptNo:selectedReceiptNo, keyword:$("docKeyword").value, full: full ? "1" : "0" });
       const data = await fetch(`/api/document?${q}`).then(r => r.json());
       if (!data.ok) { $("docRecords").textContent = data.message; return; }
       $("docRecords").innerHTML = data.html || "표시할 원문이 없습니다. 검색어를 바꿔보세요.";
+      if (data.preview) {
+        $("docRecords").insertAdjacentHTML("afterbegin", `<div class="preview-notice">큰 공시는 먼저 일부만 표시했습니다. 전체가 필요하면 상단의 전체 원문 버튼을 누르세요.</div>`);
+      }
       if ($("docKeyword").value && data.keywordCount === 0) {
         $("docRecords").insertAdjacentHTML("afterbegin", `<div class="status">검색어가 원문에서 발견되지 않았습니다. 원문 전체를 표시합니다.</div>`);
       }
     };
-    $("reloadDoc").onclick = reloadDoc;
+    $("reloadDoc").onclick = () => reloadDoc(false);
+    $("loadFullDoc").onclick = () => reloadDoc(true);
     $("tabList").onclick = () => showTab("list");
     $("tabDoc").onclick = () => showTab("doc");
     loadConfig();
