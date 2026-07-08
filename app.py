@@ -432,10 +432,10 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine]) -
         report_lines = by_receipt.get(report.receipt_no, [])
         comparison_rate_lines = [line for line in report_lines if is_comparison_rate_context(line.context)]
         test_lines = [line for line in report_lines if not is_comparison_rate_context(line.context)]
-        target_rate_lines = [line for line in test_lines if is_borrowing_target_context(line.context)]
+        target_rate_lines = [line for line in test_lines if is_valid_borrowing_rate_context(line.context)]
         avg_borrowing_rate_lines = [line for line in comparison_rate_lines if is_average_borrowing_rate_context(line.context)]
         wacc_lines = [line for line in comparison_rate_lines if is_wacc_context(line.context)]
-        rates = [rate for line in target_rate_lines for rate in line.interest_rates]
+        rates = [rate for line in target_rate_lines for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
         avg_borrowing_rates = [rate for line in avg_borrowing_rate_lines for rate in line.interest_rates]
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         benchmark_rates = avg_borrowing_rates
@@ -518,15 +518,15 @@ def is_wacc_context(text: str) -> bool:
 
 def is_average_borrowing_rate_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
+    if any(keyword in compact for keyword in ("자본비용", "증분차입", "리스부채", "자본화", "차입원가")):
+        return False
     return (
-        "자본비용" not in compact
-        and (
-            "평균차입이자율" in compact
-            or "평균차입금리" in compact
-            or "가중평균이자율" in compact
-            or "가중평균금리" in compact
-            or ("평균" in compact and ("차입" in compact or "사채" in compact) and ("이자율" in compact or "금리" in compact))
-        )
+        "평균차입이자율" in compact
+        or "평균차입금리" in compact
+        or "가중평균차입이자율" in compact
+        or "가중평균차입금리" in compact
+        or "평균사채이자율" in compact
+        or "평균사채금리" in compact
     )
 
 
@@ -536,6 +536,41 @@ def is_comparison_rate_context(text: str) -> bool:
 
 def is_borrowing_target_context(text: str) -> bool:
     return any(keyword in text for keyword in ("차입금", "사채", "금융부채", "담보제공"))
+
+
+def is_valid_borrowing_rate_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    if not any(keyword in compact for keyword in ("차입금", "사채", "차입", "borrow", "debt", "bond")):
+        return False
+    if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "interest", "rate")):
+        return False
+    excluded = (
+        "cashcoverage",
+        "coverage",
+        "유동자금/차입금",
+        "자기자본",
+        "담보제공",
+        "이자율변동",
+        "민감도",
+        "가정하",
+        "금융손익변동",
+        "자본화",
+        "차입원가",
+        "건설중인자산",
+        "리스부채",
+        "증분차입",
+        "할인율",
+        "현금흐름할인",
+        "공정가치",
+        "조건부금융부채",
+        "가중평균자본비용",
+        "wacc",
+    )
+    return not any(keyword in compact for keyword in excluded)
+
+
+def is_reasonable_interest_rate(rate: float) -> bool:
+    return 0 < rate <= 0.30
 
 
 def is_special_bond_context(text: str) -> bool:
@@ -563,7 +598,7 @@ def extract_rate(text: str) -> float | None:
 
 def extract_rate_values(text: str) -> list[float]:
     rates: list[float] = []
-    for raw in re.findall(r"(\d{1,2}(?:\.\d{1,4})?)\s*%", text):
+    for raw in re.findall(r"(?<![\d.])(\d{1,2}(?:\.\d{1,4})?)\s*%(?!\d)", text):
         try:
             rates.append(float(raw) / 100)
         except ValueError:
