@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 CORP_CACHE_PATH = ROOT / ".dart_corp_cache.json"
 DOCUMENT_PREVIEW_CHARS = 220_000
+SEARCH_CONTEXT_CHARS = 4500
+SEARCH_MAX_RESULTS = 80
 _CORP_CODES: list["CorpInfo"] | None = None
 _DOCUMENT_FILES: dict[str, list[tuple[str, str]]] = {}
 
@@ -191,6 +193,50 @@ def render_dart_document_html(files: list[tuple[str, str]], keyword: str = "", m
     return "".join(rendered)
 
 
+def render_dart_search_html(files: list[tuple[str, str]], keyword: str) -> tuple[str, int, bool]:
+    needle = keyword.strip()
+    if not needle:
+        return "", 0, False
+
+    pattern = re.compile(re.escape(needle), re.IGNORECASE)
+    rendered: list[str] = []
+    total_count = 0
+    shown = 0
+    for source, text in files:
+        raw_matches = list(pattern.finditer(text))
+        total_count += len(raw_matches)
+        if not raw_matches:
+            continue
+
+        ranges: list[tuple[int, int]] = []
+        for match in raw_matches:
+            start = max(0, match.start() - SEARCH_CONTEXT_CHARS)
+            end = min(len(text), match.end() + SEARCH_CONTEXT_CHARS)
+            if ranges and start <= ranges[-1][1]:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+
+        for start, end in ranges:
+            if shown >= SEARCH_MAX_RESULTS:
+                break
+            snippet = text[start:end]
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(text) else ""
+            body = DartDocumentRenderer(needle).render(prefix + snippet + suffix)
+            if body:
+                shown += 1
+                rendered.append(
+                    f'<article class="dart-document search-result">'
+                    f'<div class="source-name">{html.escape(source)} / 검색 결과 {shown}</div>'
+                    f"{body}</article>"
+                )
+        if shown >= SEARCH_MAX_RESULTS:
+            break
+
+    return "".join(rendered), total_count, shown >= SEARCH_MAX_RESULTS
+
+
 def text_of(node: ElementTree.Element, tag: str) -> str:
     child = node.find(tag)
     return (child.text or "").strip() if child is not None else ""
@@ -327,17 +373,31 @@ class DartClient:
 
     def get_document_html(self, receipt_no: str, keyword: str = "", full: bool = False) -> dict:
         files = self.get_document_files(receipt_no)
-        rendered = render_dart_document_html(files, keyword, None if full else DOCUMENT_PREVIEW_CHARS)
         keyword_count = 0
         if keyword.strip():
+            if not full:
+                rendered, keyword_count, limited = render_dart_search_html(files, keyword)
+                total_chars = sum(len(text) for _, text in files)
+                return {
+                    "html": rendered,
+                    "fileCount": len(files),
+                    "keywordCount": keyword_count,
+                    "preview": False,
+                    "searchMode": True,
+                    "limited": limited,
+                    "totalChars": total_chars,
+                }
             needle = re.compile(re.escape(keyword.strip()), re.IGNORECASE)
             keyword_count = sum(len(needle.findall(clean_text(text))) for _, text in files)
+        rendered = render_dart_document_html(files, keyword, None if full else DOCUMENT_PREVIEW_CHARS)
         total_chars = sum(len(text) for _, text in files)
         return {
             "html": rendered,
             "fileCount": len(files),
             "keywordCount": keyword_count,
             "preview": not full and total_chars > DOCUMENT_PREVIEW_CHARS,
+            "searchMode": False,
+            "limited": False,
             "totalChars": total_chars,
         }
 
@@ -486,6 +546,8 @@ HTML_PAGE = r"""
     .dart-table th { position:static; background:#f3f4f6; font-weight:800; }
     .dart-document mark { background:#fff3a3; padding:0 2px; }
     .preview-notice { margin:0 0 14px; padding:10px 12px; border:1px solid #f3c96b; background:#fff8e1; color:#694a05; border-radius:6px; font-weight:700; }
+    .search-result { border-top:3px solid #0f766e; padding-top:12px; }
+    .search-summary { margin:0 0 14px; padding:10px 12px; border:1px solid #99d6cf; background:#eefaf8; color:#064e47; border-radius:6px; font-weight:700; }
     .viewer-tools { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
     .viewer-tools input { max-width:260px; }
     @media (max-width:900px) { main { grid-template-columns:1fr; height:auto; } }
@@ -640,11 +702,15 @@ HTML_PAGE = r"""
       const data = await fetch(`/api/document?${q}`).then(r => r.json());
       if (!data.ok) { $("docRecords").textContent = data.message; return; }
       $("docRecords").innerHTML = data.html || "표시할 원문이 없습니다. 검색어를 바꿔보세요.";
+      if (data.searchMode) {
+        const limitText = data.limited ? " 상위 결과만 표시했습니다." : "";
+        $("docRecords").insertAdjacentHTML("afterbegin", `<div class="search-summary">원문 전체에서 ${data.keywordCount}건을 찾았습니다.${limitText}</div>`);
+      }
       if (data.preview) {
         $("docRecords").insertAdjacentHTML("afterbegin", `<div class="preview-notice">큰 공시는 먼저 일부만 표시했습니다. 전체가 필요하면 상단의 전체 원문 버튼을 누르세요.</div>`);
       }
       if ($("docKeyword").value && data.keywordCount === 0) {
-        $("docRecords").insertAdjacentHTML("afterbegin", `<div class="status">검색어가 원문에서 발견되지 않았습니다. 원문 전체를 표시합니다.</div>`);
+        $("docRecords").insertAdjacentHTML("afterbegin", `<div class="status">검색어가 원문 전체에서 발견되지 않았습니다.</div>`);
       }
     };
     $("reloadDoc").onclick = () => reloadDoc(false);
