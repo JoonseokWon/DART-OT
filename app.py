@@ -510,6 +510,27 @@ def report_period_label(report: DartReport) -> str:
     return f"{key[0]}.{key[1]:02d}"
 
 
+def beginning_borrowing_amount(
+    period_key: tuple[int, int] | None,
+    amount_cache: dict[str, tuple[int, int, str, list[BorrowingLine]]],
+    latest_report_by_period: dict[tuple[int, int], DartReport],
+) -> tuple[int | None, str]:
+    if not period_key:
+        return None, "평균차입금: 보고기간 식별 실패"
+
+    year, _ = period_key
+    prior_year_end_report = latest_report_by_period.get((year - 1, 12))
+    if prior_year_end_report:
+        beginning_amount = amount_cache.get(prior_year_end_report.receipt_no, (None, 0, "", []))[0]
+        if beginning_amount is not None:
+            return (
+                beginning_amount,
+                f"평균차입금: 전기말 {report_period_label(prior_year_end_report)} 차입잔액 {beginning_amount:,}백만원과 당기말 차입잔액 평균",
+            )
+
+    return None, "평균차입금: 전기말 재무상태표 차입잔액 미검출"
+
+
 def parse_dart_amount(value: str) -> int | None:
     cleaned = str(value or "").replace(",", "").strip()
     if not cleaned or cleaned == "-":
@@ -774,6 +795,14 @@ def interest_judgment_basis(
     return " ".join(parts)
 
 
+def disclosure_interest_judgment_basis(reference: float, actual: float, diff: float, error_rate: float, verdict_text: str) -> str:
+    return (
+        f"{verdict_text} 금융비용 주석 이자비용 {reference:,.0f}백만원과 "
+        f"상각후원가 금융부채 이자비용 {actual:,.0f}백만원을 대사했습니다. "
+        f"차이 {diff:,.0f}백만원 오차율 {error_rate:.2%}"
+    )
+
+
 def implied_interest_judgment_basis(actual: float, average_balance: float, implied_rate: float, period_months: int) -> str:
     return (
         "차입금/사채 행에서 명시 이자율을 충분히 찾지 못해 회사 계상 이자비용으로 역산한 유효이자율을 사용했습니다. "
@@ -801,7 +830,6 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             latest_report_by_period[key] = report
 
     rows: list[dict] = []
-    prev_amount_sum: int | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
         report_lines = by_receipt.get(report.receipt_no, [])
         comparison_rate_lines = [line for line in report_lines if is_comparison_rate_context(line.context)]
@@ -834,17 +862,24 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
-        if amount_sum > 0:
-            average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None and prev_amount_sum > 0 else amount_sum
-        elif has_amount_candidate and prev_amount_sum is not None and prev_amount_sum > 0:
-            average_borrowing_balance = prev_amount_sum / 2
+        beginning_amount, average_method = beginning_borrowing_amount(period_key, amount_cache, latest_report_by_period)
+        if amount_sum > 0 and beginning_amount is not None and beginning_amount > 0:
+            average_borrowing_balance = (beginning_amount + amount_sum) / 2
+        elif amount_sum > 0:
+            average_borrowing_balance = amount_sum
+            average_method = "평균차입금: 전기말 잔액을 찾지 못해 당기말 잔액 사용"
+        elif has_amount_candidate and beginning_amount is not None and beginning_amount > 0:
+            average_borrowing_balance = beginning_amount / 2
+            average_method = f"평균차입금: 당기말 잔액 0, 전기말 잔액 {beginning_amount:,}백만원의 절반 사용"
         else:
             average_borrowing_balance = None
+            average_method = "평균차입금: 전기말 및 당기말 차입잔액 부족"
         period_months = report_period_months(report)
         period_factor = period_months / 12
         financial_expense = extract_note_interest_expense(report_lines) or financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
         actual_interest_expense = financial_expense.actual_interest_expense
         actual_interest_comparable = actual_interest_expense is not None and is_exact_interest_expense_account(financial_expense.account_name)
+        disclosure_comparison = note_interest_disclosure_comparison(report_lines)
         implied_rate_used = False
         if (
             avg_rate is None
@@ -870,7 +905,38 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        if not has_amount_candidate or average_borrowing_balance in (None, 0):
+        if disclosure_comparison is not None:
+            reference_interest, disclosed_interest, disclosure_diff, disclosure_error_rate = disclosure_comparison
+            expected_interest_expense = reference_interest
+            actual_interest_expense = disclosed_interest
+            interest_expense_diff = disclosure_diff
+            interest_expense_error_rate = disclosure_error_rate
+            financial_expense = FinancialExpense(
+                report.receipt_no,
+                disclosed_interest,
+                "주석 간 이자비용 대사",
+                "금융비용 주석 이자비용과 상각후원가 금융부채 이자비용 대사",
+            )
+            actual_interest_comparable = True
+            if abs(disclosure_error_rate) <= 0.05:
+                judgment = "적정"
+                judgment_basis = disclosure_interest_judgment_basis(
+                    reference_interest,
+                    disclosed_interest,
+                    disclosure_diff,
+                    disclosure_error_rate,
+                    "주석 간 이자비용 공시값의 차이가 ±5% 이내입니다.",
+                )
+            else:
+                judgment = "확인필요"
+                judgment_basis = disclosure_interest_judgment_basis(
+                    reference_interest,
+                    disclosed_interest,
+                    disclosure_diff,
+                    disclosure_error_rate,
+                    "주석 간 이자비용 공시값의 차이가 ±5%를 초과합니다.",
+                )
+        elif not has_amount_candidate or average_borrowing_balance in (None, 0):
             judgment = "판단불가"
             if has_amount_candidate:
                 judgment_basis = f"재무상태표 차입금/사채 잔액이 0이고 비교 가능한 전기 잔액이 없어 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
@@ -937,7 +1003,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "wacc_count": len(wacc_rates),
                 "amount_sum": amount_sum,
                 "max_amount": max_amount,
-                "amount_method": amount_method,
+                "amount_method": f"{amount_method}; {average_method}",
                 "amount_comparison_label": amount_comparison_label,
                 "amount_diff": amount_diff,
                 "amount_change": amount_change,
@@ -964,9 +1030,6 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "caution_reason": caution_reason,
             }
         )
-        if has_amount_candidate:
-            prev_amount_sum = amount_sum
-
     return rows
 
 
@@ -1194,6 +1257,36 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
         memo = f"주석 금융원가 표의 차입 관련 이자비용 {len(selected_group)}개 항목 합산"
     receipt_no = lines[0].receipt_no if lines else ""
     return FinancialExpense(receipt_no, amount, "차입/금융부채 이자비용", memo)
+
+
+def note_interest_disclosure_comparison(lines: list[BorrowingLine]) -> tuple[int, int, int, float] | None:
+    finance_expense_amounts: list[int] = []
+    amortized_liability_amounts: list[int] = []
+    seen_contexts: set[str] = set()
+    for line in lines:
+        if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD:
+            continue
+        if line.context in seen_contexts:
+            continue
+        seen_contexts.add(line.context)
+        amount = extract_interest_expense_amount(line)
+        if amount is None or amount <= 0:
+            continue
+        if is_amortized_financial_liability_interest(line.context):
+            amortized_liability_amounts.append(amount)
+        elif is_financial_expense_summary_context(line.context) or line.section == "금융수익 및 금융비용 주석":
+            finance_expense_amounts.append(amount)
+
+    if not finance_expense_amounts or not amortized_liability_amounts:
+        return None
+
+    reference = max(finance_expense_amounts)
+    actual = max(amortized_liability_amounts)
+    if reference <= 0:
+        return None
+    diff = actual - reference
+    error_rate = diff / reference
+    return reference, actual, diff, error_rate
 
 
 def interest_expense_group_amount(group: list[tuple[BorrowingLine, int]]) -> tuple[int, bool]:
