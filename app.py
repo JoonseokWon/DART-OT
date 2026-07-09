@@ -238,7 +238,7 @@ class DartClient:
             if not is_financial_borrowing_account(account):
                 continue
             amount = parse_dart_amount(row.get("thstrm_amount", ""))
-            if amount is None or amount <= 0:
+            if amount is None:
                 continue
             selected.append((account, amount // 1_000_000))
 
@@ -529,12 +529,13 @@ def is_financial_borrowing_account(account: str) -> bool:
         "유동성장기부채",
         "유동성장기차입금",
         "유동성사채",
+        "차입부채",
     }
     if compact in exact_accounts:
         return True
     if any(excluded in compact for excluded in ("리스", "이자", "파생", "충당", "순확정")):
         return False
-    return compact.endswith("차입금") or compact.endswith("사채")
+    return compact.endswith("차입금") or compact.endswith("사채") or compact.endswith("차입부채")
 
 
 def is_exact_interest_expense_account(account: str) -> bool:
@@ -788,6 +789,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         else:
             benchmark_label = "평균차입이자율 미공시"
         amount_sum, max_amount, amount_method, amount_used_lines = amount_cache.get(report.receipt_no, (0, 0, "차입금 잔액 후보 없음", []))
+        has_amount_candidate = bool(amount_used_lines)
         period_key = report_period_key(report)
         yoy_report = latest_report_by_period.get((period_key[0] - 1, period_key[1])) if period_key else None
         yoy_amount_sum = amount_cache.get(yoy_report.receipt_no, (None, 0, "", []))[0] if yoy_report else None
@@ -802,6 +804,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
         if amount_sum > 0:
             average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None and prev_amount_sum > 0 else amount_sum
+        elif has_amount_candidate and prev_amount_sum is not None and prev_amount_sum > 0:
+            average_borrowing_balance = prev_amount_sum / 2
         else:
             average_borrowing_balance = None
         period_factor = report_period_months(report) / 12
@@ -819,9 +823,12 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             amount_unit = "혼합: " + ", ".join(amount_units)
 
         period_months = report_period_months(report)
-        if amount_sum <= 0 or average_borrowing_balance in (None, 0):
+        if not has_amount_candidate or average_borrowing_balance in (None, 0):
             judgment = "판단불가"
-            judgment_basis = f"차입금/사채 잔액 후보를 찾지 못해 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
+            if has_amount_candidate:
+                judgment_basis = f"재무상태표 차입금/사채 잔액이 0이고 비교 가능한 전기 잔액이 없어 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
+            else:
+                judgment_basis = f"차입금/사채 잔액 후보를 찾지 못해 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
         elif avg_rate is None:
             judgment = "판단불가"
             judgment_basis = "차입금/사채 행에서 이자율 후보가 부족해 예상 이자비용을 산정할 수 없습니다."
@@ -907,13 +914,19 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "caution_reason": caution_reason,
             }
         )
-        if amount_sum > 0:
+        if has_amount_candidate:
             prev_amount_sum = amount_sum
 
     return rows
 
 
 def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, str, list[BorrowingLine]]:
+    financial_api_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json" and "재무제표API" in line.context]
+    if financial_api_lines:
+        selected_line = max(financial_api_lines, key=lambda line: line.max_amount)
+        amount = normalize_amount_to_million(selected_line.amounts[0], selected_line.amount_unit) if selected_line.amounts else 0
+        return amount, amount, "재무상태표 차입 항목 우선", [selected_line]
+
     candidates: list[tuple[BorrowingLine, int]] = []
     seen_contexts: set[str] = set()
     for line in lines:
@@ -1244,10 +1257,12 @@ def is_total_amount_context(text: str) -> bool:
 
 
 def is_statement_borrowing_row(line: BorrowingLine) -> bool:
+    if line.source_file == "fnlttSinglAcntAll.json":
+        return True
     if line.line_no > 2500:
         return False
     compact = re.sub(r"\s+", "", line.context)
-    if not any(keyword in compact for keyword in ("단기차입금", "장기차입금", "유동성장기부채", "유동성사채", "사채")):
+    if not any(keyword in compact for keyword in ("단기차입금", "장기차입금", "유동성장기부채", "유동성사채", "차입부채", "사채")):
         return False
     return bool(re.search(r"\b\d{1,2}(?:,\s*\d{1,2}){1,8}\b", line.context))
 
@@ -1264,6 +1279,8 @@ def borrowing_amount_category(text: str) -> str:
         return "유동성사채"
     if "사채" in compact:
         return "사채"
+    if "차입부채" in compact:
+        return "차입부채"
     return borrowing_line_label(text)
 
 
