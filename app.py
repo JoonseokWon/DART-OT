@@ -26,6 +26,7 @@ from xml.etree import ElementTree
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
+UI_DEBUG_PATH = OUTPUT_DIR / "ui_debug.log"
 BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공", "이자비용", "금융원가"]
 DISPLAY_KEYWORDS = [
     "전환사채",
@@ -40,6 +41,16 @@ DISPLAY_KEYWORDS = [
     "담보제공",
 ]
 NOTE_INTEREST_EXPENSE_KEYWORD = "차입관련 이자비용"
+
+
+def write_ui_debug(message: str) -> None:
+    try:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with UI_DEBUG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 @dataclass
@@ -1674,7 +1685,8 @@ class DartOtApp(tk.Tk):
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
         self.tk.call("tk", "scaling", 1.35)
-        self.entry_font = ("맑은 고딕", 12)
+        self.entry_font = tkfont.Font(self, family="맑은 고딕", size=12)
+        write_ui_debug(f"app_start scaling={self.tk.call('tk', 'scaling')} entry_font={self.entry_font.actual()}")
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
@@ -1804,6 +1816,23 @@ class DartOtApp(tk.Tk):
         )
         self.company_entry.pack(fill="x", ipady=5)
         self.company_entry.bind("<Return>", lambda _event: self.search_company())
+        self.company_entry.bind("<KeyRelease>", self.log_company_entry_state)
+        self.log_company_entry_state()
+
+    def log_company_entry_state(self, _event=None) -> None:
+        if self.company_entry is None:
+            return
+        try:
+            write_ui_debug(
+                "company_entry "
+                f"class={self.company_entry.winfo_class()} "
+                f"height={self.company_entry.winfo_height()} "
+                f"font={self.entry_font.actual()} "
+                f"scaling={self.tk.call('tk', 'scaling')} "
+                f"text_len={len(self.company_var.get())}"
+            )
+        except Exception:
+            pass
 
     def focus_next_company_widget(self):
         if self.company_entry is not None:
