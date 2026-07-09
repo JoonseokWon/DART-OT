@@ -888,9 +888,12 @@ def borrowing_lines_from_table_rows(
     date_by_col = table_date_values(table_rows)
     total_cols = table_total_columns(table_rows)
     for rate_idx, rate_cells in rate_rows:
+        if is_prior_period_table_segment(table_rows, rate_idx):
+            continue
         rates_by_col = table_rates_by_column(rate_cells)
         if not rates_by_col:
             continue
+        excluded_cols = total_cols | table_excluded_columns_near_rate(table_rows, rate_idx)
         next_rate_idx = min((idx for idx, _ in rate_rows if idx > rate_idx), default=len(table_rows))
         nearby_amount_rows = [
             (idx, cells)
@@ -902,7 +905,7 @@ def borrowing_lines_from_table_rows(
             if not label:
                 continue
             for col, amount in table_amounts_by_column(amount_cells, unit).items():
-                if col in total_cols:
+                if col in excluded_cols:
                     continue
                 rates = rates_by_col.get(col)
                 if not rates:
@@ -1032,8 +1035,10 @@ def table_rates_by_column(cells: list[str]) -> dict[int, list[float]]:
     rates_by_col: dict[int, list[float]] = {}
     for idx, cell in enumerate(cells):
         rates = extract_rate_values("이자율 " + cell)
-        rates = [rate for rate in rates if is_reasonable_interest_rate(rate)]
-        if rates:
+        if not rates and re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
+            rates = [0.0]
+        rates = [rate for rate in rates if 0 <= rate <= 0.50]
+        if rates or re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
             rates_by_col[idx] = rates
     return rates_by_col
 
@@ -1056,6 +1061,14 @@ def nearest_rate_column_value(values_by_col: dict[int, list[float]], col: int) -
     if not values_by_col:
         return None
     nearest = min(values_by_col, key=lambda idx: abs(idx - col))
+    if nearest < col:
+        left_pair_cols = [idx for idx in values_by_col if idx < nearest and nearest - idx <= 2]
+        if left_pair_cols:
+            pair_col = max(left_pair_cols)
+            pair_values = values_by_col[pair_col] + values_by_col[nearest]
+            pair_values = [value for value in pair_values if 0 <= value <= 0.50]
+            if pair_values and any(value > 0 for value in pair_values):
+                return [sum(pair_values) / len(pair_values)]
     if abs(nearest - col) <= 3:
         return values_by_col[nearest]
     return None
@@ -1090,9 +1103,40 @@ def table_total_columns(table_rows: list[list[str]]) -> set[int]:
     for cells in table_rows[:8]:
         for idx, cell in enumerate(cells):
             compact = re.sub(r"\s+", "", cell)
-            if "합계" in compact or "총계" in compact:
+            if is_excluded_total_header(compact):
                 cols.add(idx)
     return cols
+
+
+def table_excluded_columns_near_rate(table_rows: list[list[str]], rate_idx: int) -> set[int]:
+    cols: set[int] = set()
+    for cells in table_rows[max(0, rate_idx - 8) : rate_idx]:
+        for idx, cell in enumerate(cells):
+            compact = re.sub(r"\s+", "", cell)
+            if is_excluded_total_header(compact) or any(keyword in compact for keyword in ("리스부채", "리스 부채")):
+                cols.add(idx)
+    return cols
+
+
+def is_excluded_total_header(compact: str) -> bool:
+    if "범위합계" in compact:
+        return False
+    return "총계" in compact or any(
+        keyword in compact
+        for keyword in ("차입금합계", "차입금명칭합계", "명칭합계", "사채합계", "유동성차입금합계", "장기차입금합계", "단기차입금합계")
+    )
+
+
+def is_prior_period_table_segment(table_rows: list[list[str]], rate_idx: int) -> bool:
+    markers: list[str] = []
+    for cells in table_rows[max(0, rate_idx - 12) : rate_idx]:
+        row_text = re.sub(r"\s+", "", " ".join(cells))
+        for marker in ("당분기말", "당반기말", "당기말", "당분기", "당반기", "당기", "전분기말", "전반기말", "전기말", "전분기", "전반기", "전기"):
+            if marker in row_text:
+                markers.append(marker)
+    if not markers:
+        return False
+    return markers[-1].startswith("전")
 
 
 def note_section_for_context(text: str) -> str:
@@ -1452,6 +1496,8 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
     seen_contexts: set[str] = set()
     note_lines = [line for line in lines if line.source_file != "fnlttSinglAcntAll.json"]
     for line in note_lines:
+        if line.interest_rates:
+            continue
         if not is_borrowing_amount_context(line.context):
             continue
         amount = extract_current_amount(line)
