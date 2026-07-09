@@ -14,7 +14,8 @@ import urllib.request
 import webbrowser
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+import calendar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -1017,9 +1018,9 @@ def build_overall_tests(
             benchmark_label = "평균차입이자율 미공시"
         amount_sum, max_amount, amount_method, amount_used_lines = amount_cache.get(report.receipt_no, (0, 0, "차입금 잔액 후보 없음", []))
         period_months = report_period_months(report)
-        weighted_rate = weighted_average_interest_rate(target_rate_lines, amount_sum, period_months)
-        has_amount_candidate = bool(amount_used_lines)
         period_key = report_period_key(report)
+        weighted_rate = weighted_average_interest_rate(target_rate_lines, amount_sum, period_key, period_months)
+        has_amount_candidate = bool(amount_used_lines)
         yoy_report = latest_report_by_period.get((period_key[0] - 1, period_key[1])) if period_key else None
         yoy_amount_sum = amount_cache.get(yoy_report.receipt_no, (None, 0, "", []))[0] if yoy_report else None
         amount_diff = amount_sum - yoy_amount_sum if yoy_amount_sum is not None else None
@@ -1905,14 +1906,19 @@ def is_borrowing_target_context(text: str) -> bool:
 def is_valid_borrowing_rate_line(line: BorrowingLine) -> bool:
     if not line.interest_rates:
         return False
-    if line.section != "차입금/사채 주석":
+    if not is_borrowing_note_section(line.section):
         return False
     if not is_borrowing_target_context(line.context):
         return False
-    return is_valid_borrowing_rate_context(line.context)
+    return is_valid_borrowing_rate_context(line.context, allow_mixed_lease=True)
 
 
-def is_valid_borrowing_rate_context(text: str) -> bool:
+def is_borrowing_note_section(section: str) -> bool:
+    compact = re.sub(r"\s+", "", section or "")
+    return "차입금" in compact or "사채" in compact
+
+
+def is_valid_borrowing_rate_context(text: str, allow_mixed_lease: bool = False) -> bool:
     compact = re.sub(r"\s+", "", text).lower()
     if is_non_interest_percent_context(text):
         return False
@@ -1931,7 +1937,6 @@ def is_valid_borrowing_rate_context(text: str) -> bool:
         "자본화",
         "차입원가",
         "건설중인자산",
-        "리스부채",
         "증분차입",
         "할인율",
         "현금흐름할인",
@@ -1940,7 +1945,11 @@ def is_valid_borrowing_rate_context(text: str) -> bool:
         "가중평균자본비용",
         "wacc",
     )
-    return not any(keyword in compact for keyword in excluded)
+    if any(keyword in compact for keyword in excluded):
+        return False
+    if "리스부채" in compact and not allow_mixed_lease:
+        return False
+    return True
 
 
 def is_non_interest_percent_context(text: str) -> bool:
@@ -1979,10 +1988,16 @@ def estimation_interest_rates(line: BorrowingLine) -> list[float]:
     return [rate for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
 
 
-def weighted_average_interest_rate(lines: list[BorrowingLine], reference_amount: int, default_months: int) -> float | None:
+def weighted_average_interest_rate(
+    lines: list[BorrowingLine],
+    reference_amount: int,
+    period_key: tuple[int, int] | None,
+    default_months: int,
+) -> float | None:
     weighted_sum = 0.0
     weight_total = 0.0
     amount_total = 0
+    default_days = report_period_days(period_key, default_months)
     seen_contexts: set[str] = set()
     for line in lines:
         key = normalize_text(line.context)
@@ -1995,15 +2010,55 @@ def weighted_average_interest_rate(lines: list[BorrowingLine], reference_amount:
         amount = extract_current_amount(line)
         if amount is None or amount <= 0:
             continue
-        months = interest_rate_weight_months(line.context, default_months)
-        weighted_sum += line_rate * amount * months
-        weight_total += amount * months
+        days = interest_rate_weight_days(line.context, period_key, default_days)
+        if days <= 0:
+            continue
+        weighted_sum += line_rate * amount * days
+        weight_total += amount * days
         amount_total += amount
     if not weight_total:
         return None
     if reference_amount > 0 and amount_total < reference_amount * 0.5:
         return None
     return weighted_sum / weight_total
+
+
+def report_period_days(period_key: tuple[int, int] | None, default_months: int) -> int:
+    if not period_key:
+        return round(365 * max(1, min(default_months, 12)) / 12)
+    start, end = report_period_dates(period_key)
+    return (end - start).days + 1
+
+
+def report_period_dates(period_key: tuple[int, int]) -> tuple[date, date]:
+    year, month = period_key
+    month = max(1, min(month, 12))
+    end_day = calendar.monthrange(year, month)[1]
+    return date(year, 1, 1), date(year, month, end_day)
+
+
+def interest_rate_weight_days(text: str, period_key: tuple[int, int] | None, default_days: int) -> int:
+    if period_key:
+        period_start, period_end = report_period_dates(period_key)
+        dates = extract_dates(text)
+        if dates:
+            start = max(period_start, min(dates))
+            end = min(period_end, max(dates))
+            if start <= end:
+                return (end - start).days + 1
+            return 0
+    months = interest_rate_weight_months(text, max(1, round(default_days / 30.4)))
+    return round(365 * months / 12)
+
+
+def extract_dates(text: str) -> list[date]:
+    dates: list[date] = []
+    for year, month, day in re.findall(r"(\d{4})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})", text):
+        try:
+            dates.append(date(int(year), int(month), int(day)))
+        except ValueError:
+            continue
+    return dates
 
 
 def interest_rate_weight_months(text: str, default_months: int) -> int:
