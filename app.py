@@ -778,7 +778,7 @@ def implied_interest_judgment_basis(actual: float, average_balance: float, impli
     return (
         "차입금/사채 행에서 명시 이자율을 충분히 찾지 못해 회사 계상 이자비용으로 역산한 유효이자율을 사용했습니다. "
         f"역산유효이자율 {implied_rate:.2%} = 실제이자비용 {actual:,.0f}백만원 ÷ 평균차입금 {average_balance:,.0f}백만원 ÷ {period_months}/12. "
-        "역산유효이자율이 0%~30% 범위라 적정으로 분류했습니다."
+        "역산유효이자율은 0%~30% 범위지만 공시 이자율을 직접 확인하지 못했으므로 확인필요로 분류했습니다."
     )
 
 
@@ -883,7 +883,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             judgment = "판단불가"
             judgment_basis = "금융비용 대체값은 외환손익 등 다른 항목이 섞일 수 있어 적정 판정에서 제외했습니다."
         elif implied_rate_used:
-            judgment = "적정"
+            judgment = "확인필요"
             judgment_basis = implied_interest_judgment_basis(actual_interest_expense, average_borrowing_balance, avg_rate, period_months)
         elif avg_rate is None:
             judgment = "판단불가"
@@ -1381,6 +1381,8 @@ def is_borrowing_target_context(text: str) -> bool:
 
 def is_valid_borrowing_rate_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text).lower()
+    if is_non_interest_percent_context(text):
+        return False
     if not any(keyword in compact for keyword in ("차입금", "사채", "차입", "borrow", "debt", "bond")):
         return False
     if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "interest", "rate")) and not has_rate_pattern(text):
@@ -1408,6 +1410,32 @@ def is_valid_borrowing_rate_context(text: str) -> bool:
         "wacc",
     )
     return not any(keyword in compact for keyword in excluded)
+
+
+def is_non_interest_percent_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    if any(keyword in compact for keyword in ("표면", "만기이자", "액면이자", "연이자", "이자율", "이율", "금리", "interest", "rate")):
+        return False
+    non_interest_keywords = (
+        "옵션",
+        "조기상환청구권",
+        "매도청구권",
+        "전환청구",
+        "전환가액",
+        "전환가격",
+        "행사가액",
+        "전환권",
+        "상환권",
+        "액면금액의",
+        "발행금액",
+        "유상증자",
+        "자본총계",
+        "소유지분율",
+        "지분율",
+        "보통주",
+        "우선주",
+    )
+    return "%" in text and any(keyword in compact for keyword in non_interest_keywords)
 
 
 def is_reasonable_interest_rate(rate: float) -> bool:
