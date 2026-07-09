@@ -1494,6 +1494,7 @@ def build_overall_tests(
 def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, str, list[BorrowingLine]]:
     candidates: list[tuple[BorrowingLine, int]] = []
     seen_contexts: set[str] = set()
+    financial_api_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
     note_lines = [line for line in lines if line.source_file != "fnlttSinglAcntAll.json"]
     for line in note_lines:
         if line.interest_rates:
@@ -1543,15 +1544,29 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
     amount_sum = sum(amount for _, amount in selected)
     max_amount = max((amount for _, amount in selected), default=0)
     if selected:
+        financial_amount, financial_line = financial_statement_borrowing_amount(financial_api_lines)
+        if financial_amount > 0 and amount_sum > financial_amount * 1.5:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 합산액 {amount_sum:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과대하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
         return amount_sum, max_amount, "차입금/사채 주석 항목별 당기 금액 합산", [line for line, _ in selected]
 
-    financial_api_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
     if financial_api_lines:
-        selected_line = max(financial_api_lines, key=lambda line: line.max_amount)
-        amount = normalize_amount_to_million(selected_line.amounts[0], selected_line.amount_unit) if selected_line.amounts else 0
+        amount, selected_line = financial_statement_borrowing_amount(financial_api_lines)
         return amount, amount, "차입금/사채 주석 미검출: 재무상태표 차입 항목 사용", [selected_line]
 
     return 0, 0, "차입금 잔액 후보 없음", []
+
+
+def financial_statement_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, BorrowingLine | None]:
+    if not lines:
+        return 0, None
+    selected_line = max(lines, key=lambda line: line.max_amount)
+    amount = normalize_amount_to_million(selected_line.amounts[0], selected_line.amount_unit) if selected_line.amounts else 0
+    return amount, selected_line
 
 
 def extract_current_amount(line: BorrowingLine) -> int | None:
@@ -1565,8 +1580,17 @@ def extract_current_amount(line: BorrowingLine) -> int | None:
         return None
     compact = re.sub(r"\s+", "", line.context)
     if "차입금명칭" in compact and len(values) > 1:
-        return sum(normalize_amount_to_million(value, line.amount_unit) for value in values)
-    return normalize_amount_to_million(max(values), line.amount_unit)
+        return sum(normalize_amount_to_million(value, borrowing_amount_unit_for_context(value, line.amount_unit, line.context)) for value in values)
+    value = max(values)
+    return normalize_amount_to_million(value, borrowing_amount_unit_for_context(value, line.amount_unit, line.context))
+
+
+def borrowing_amount_unit_for_context(value: int, unit: str, context: str) -> str:
+    compact_unit = re.sub(r"\s+", "", unit or "")
+    compact_context = re.sub(r"\s+", "", context or "")
+    if compact_unit in ("억원", "원") and compact_unit not in compact_context and value >= 100_000:
+        return "백만원"
+    return compact_unit
 
 
 def is_current_period_zero_amount(text: str) -> bool:
