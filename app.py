@@ -16,6 +16,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 import calendar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -138,6 +139,8 @@ class InterestTest:
 class DartClient:
     def __init__(self, api_key: str):
         self.api_key = api_key.strip()
+        self._financial_rows_cache: dict[tuple[str, str], list[dict]] = {}
+        self._document_text_cache: dict[str, list[tuple[str, str]]] = {}
 
     def resolve_corp(self, corp_code: str, stock_code: str, company_name: str) -> CorpInfo | None:
         corps = self.get_corp_codes()
@@ -235,6 +238,9 @@ class DartClient:
         return sorted(reports, key=lambda r: (r.receipt_date, r.report_name), reverse=True)
 
     def get_financial_statement_rows(self, corp_code: str, report: DartReport) -> list[dict]:
+        cache_key = (corp_code, report.receipt_no)
+        if cache_key in self._financial_rows_cache:
+            return self._financial_rows_cache[cache_key]
         bsns_year = report_business_year(report)
         reprt_code = report_code(report)
         if not bsns_year or not reprt_code:
@@ -251,7 +257,10 @@ class DartClient:
                 },
             )
             if data.get("status") == "000" and data.get("list"):
-                return data.get("list", [])
+                rows = data.get("list", [])
+                self._financial_rows_cache[cache_key] = rows
+                return rows
+        self._financial_rows_cache[cache_key] = []
         return []
 
     def extract_financial_borrowing_line(self, corp_code: str, report: DartReport) -> BorrowingLine | None:
@@ -329,46 +338,54 @@ class DartClient:
         files = self.get_document_texts(report.receipt_no)
         rows: list[BorrowingLine] = []
         for source_file, text in files:
-            for line_no, context, amount_unit, section in extract_text_records(text):
-                if not context:
-                    continue
-                keyword = display_keyword_for_context(context, section)
-                if not keyword:
-                    continue
-                rates = extract_rate_values(context)
-                amounts = extract_amount_values(context)
-                if note_section_for_context(context) and not rates and not amounts:
-                    continue
-                if keyword == NOTE_INTEREST_EXPENSE_KEYWORD:
-                    interest_amount = extract_amount_after_interest_expense_label(context, amount_unit)
-                    if interest_amount is None:
+            for chunk_start, chunk_text in relevant_note_chunks(text):
+                base_line_no = text.count("\n", 0, chunk_start)
+                for line_no, context, amount_unit, section in extract_text_records(chunk_text):
+                    if not context:
                         continue
-                    max_amount = interest_amount
-                else:
-                    explicit_amounts = extract_explicit_amounts_to_million(context)
-                    max_amount = max(explicit_amounts, default=max((abs(a) for a in amounts), default=0))
-                rows.append(
-                    BorrowingLine(
-                        report.corp_name,
-                        report.report_name,
-                        report.receipt_date,
-                        report.receipt_no,
-                        keyword,
-                        section,
-                        rates,
-                        amounts,
-                        amount_unit,
-                        max_amount,
-                        Path(source_file).name or f"{report.receipt_no}.xml",
-                        line_no,
-                        context[:1200],
+                    keyword = display_keyword_for_context(context, section)
+                    if not keyword:
+                        continue
+                    rates = extract_rate_values(context)
+                    amounts = extract_amount_values(context)
+                    if note_section_for_context(context) and not rates and not amounts:
+                        continue
+                    if keyword == NOTE_INTEREST_EXPENSE_KEYWORD:
+                        interest_amount = extract_amount_after_interest_expense_label(context, amount_unit)
+                        if interest_amount is None:
+                            continue
+                        max_amount = interest_amount
+                    else:
+                        if not rates and not has_borrowing_keyword(context):
+                            continue
+                        explicit_amounts = extract_explicit_amounts_to_million(context)
+                        if not rates and not amounts and not explicit_amounts:
+                            continue
+                        max_amount = max(explicit_amounts, default=max((abs(a) for a in amounts), default=0))
+                    rows.append(
+                        BorrowingLine(
+                            report.corp_name,
+                            report.report_name,
+                            report.receipt_date,
+                            report.receipt_no,
+                            keyword,
+                            section,
+                            rates,
+                            amounts,
+                            amount_unit,
+                            max_amount,
+                            Path(source_file).name or f"{report.receipt_no}.xml",
+                            base_line_no + line_no,
+                            context[:1200],
+                        )
                     )
-                )
-            rows.extend(extract_borrowing_table_rate_lines(report, source_file, text))
-            rows.extend(extract_interest_expense_lines_from_document(report, source_file, text))
+                rows.extend(extract_borrowing_table_rate_lines(report, source_file, chunk_text))
+                rows.extend(extract_interest_expense_lines_from_document(report, source_file, chunk_text))
         return rows
 
     def get_document_texts(self, receipt_no: str) -> list[tuple[str, str]]:
+        if receipt_no in self._document_text_cache:
+            return self._document_text_cache[receipt_no]
         data = self._get_bytes(
             "https://opendart.fss.or.kr/api/document.xml",
             {"crtfc_key": self.api_key, "rcept_no": receipt_no},
@@ -382,6 +399,7 @@ class DartClient:
                         files.append((name, decode_dart_document(archive.read(name))))
         except zipfile.BadZipFile:
             files.append((f"{receipt_no}.xml", decode_dart_document(data)))
+        self._document_text_cache[receipt_no] = files
         return files
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
@@ -416,23 +434,49 @@ def run_report(payload: dict) -> dict:
     borrowing_lines: list[BorrowingLine] = []
     revenues: dict[str, int] = {}
     issues: list[ExtractionIssue] = []
-    for report in reports:
+
+    def process_report(report: DartReport) -> tuple[DartReport, list[BorrowingLine], int | None, list[ExtractionIssue]]:
+        report_lines: list[BorrowingLine] = []
+        report_issues: list[ExtractionIssue] = []
+        report_revenue: int | None = None
         try:
             financial_line = client.extract_financial_borrowing_line(corp.corp_code, report)
             if financial_line is not None:
-                borrowing_lines.append(financial_line)
+                report_lines.append(financial_line)
         except Exception as exc:
-            issues.append(extraction_issue(report, "financial_statement", exc))
+            report_issues.append(extraction_issue(report, "financial_statement", exc))
         try:
             revenue = client.extract_revenue(corp.corp_code, report)
             if revenue is not None:
-                revenues[report.receipt_no] = revenue
+                report_revenue = revenue
         except Exception as exc:
-            issues.append(extraction_issue(report, "revenue", exc))
+            report_issues.append(extraction_issue(report, "revenue", exc))
         try:
-            borrowing_lines.extend(client.extract_borrowing_lines(report))
+            report_lines.extend(client.extract_borrowing_lines(report))
         except Exception as exc:
-            issues.append(extraction_issue(report, "borrowing_note", exc))
+            report_issues.append(extraction_issue(report, "borrowing_note", exc))
+        return report, report_lines, report_revenue, report_issues
+
+    max_workers = min(4, max(1, len(reports)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(process_report, report): report for report in reports}
+        processed: dict[str, tuple[list[BorrowingLine], int | None, list[ExtractionIssue]]] = {}
+        for future in as_completed(future_map):
+            try:
+                report, report_lines, revenue, report_issues = future.result()
+            except Exception as exc:
+                report = future_map[future]
+                report_lines = []
+                revenue = None
+                report_issues = [extraction_issue(report, "report_worker", exc)]
+            processed[report.receipt_no] = (report_lines, revenue, report_issues)
+
+    for report in reports:
+        report_lines, revenue, report_issues = processed.get(report.receipt_no, ([], None, []))
+        borrowing_lines.extend(report_lines)
+        if revenue is not None:
+            revenues[report.receipt_no] = revenue
+        issues.extend(report_issues)
 
     tests = build_overall_tests(reports, borrowing_lines, revenues)
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -772,6 +816,34 @@ def extract_text_records(text: str) -> list[tuple[int, str, str, str]]:
     return records
 
 
+def relevant_note_chunks(text: str) -> list[tuple[int, str]]:
+    markers = [
+        "차입금",
+        "사채",
+        "금융비용",
+        "금융 비용",
+        "이자비용",
+        "Borrowing",
+        "Borrowings",
+        "Debt",
+        "Bond",
+        "Interest expense",
+    ]
+    matches = [match.start() for marker in markers for match in re.finditer(re.escape(marker), text, flags=re.IGNORECASE)]
+    if not matches:
+        return [(0, text)]
+
+    windows: list[tuple[int, int]] = []
+    for pos in sorted(set(matches)):
+        start = max(0, pos - 10000)
+        end = min(len(text), pos + 50000)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+    return [(start, text[start:end]) for start, end in windows]
+
+
 def extract_interest_expense_lines_from_document(report: DartReport, source_file: str, text: str) -> list[BorrowingLine]:
     plain = clean_context(text)
     rows: list[BorrowingLine] = []
@@ -848,19 +920,30 @@ def extract_borrowing_table_rate_lines(report: DartReport, source_file: str, tex
     seen: set[str] = set()
     for table_match in re.finditer(r"<TABLE\b.*?</TABLE>", text, flags=re.IGNORECASE | re.DOTALL):
         table_html = table_match.group(0)
+        if not should_parse_borrowing_rate_table(table_html):
+            continue
         table_text = clean_context(table_html)
         section = borrowing_section_for_table(text, table_match.start(), table_text)
         unit = detect_amount_unit(table_text) or detect_amount_unit(clean_context(text[max(0, table_match.start() - 800) : table_match.start()]))
         table_rows = parse_table_rows(table_html)
         rows.extend(borrowing_lines_from_table_rows(report, source_file, text, table_match.start(), table_rows, table_text, section, unit, seen))
 
-    for group_start, group_html in parse_tr_groups(text):
+    for group_start, group_html in parse_rate_tr_windows(text):
+        if not should_parse_borrowing_rate_table(group_html):
+            continue
         table_text = clean_context(group_html)
         section = borrowing_section_for_table(text, group_start, table_text)
         unit = detect_amount_unit(table_text) or detect_amount_unit(clean_context(text[max(0, group_start - 800) : group_start]))
         table_rows = parse_table_rows(group_html)
         rows.extend(borrowing_lines_from_table_rows(report, source_file, text, group_start, table_rows, table_text, section, unit, seen))
     return rows
+
+
+def should_parse_borrowing_rate_table(raw_html: str) -> bool:
+    compact = re.sub(r"\s+", "", raw_html)
+    if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "InterestRate", "interestrate")):
+        return False
+    return any(keyword in compact for keyword in ("차입금", "사채", "회사채", "Borrowing", "Borrowings", "Debt", "Bond"))
 
 
 def borrowing_lines_from_table_rows(
@@ -980,6 +1063,24 @@ def parse_tr_groups(text: str) -> list[tuple[int, str]]:
     return groups
 
 
+def parse_rate_tr_windows(text: str) -> list[tuple[int, str]]:
+    matches = list(re.finditer(r"<TR\b.*?</TR>", text, flags=re.IGNORECASE | re.DOTALL))
+    windows: list[tuple[int, str]] = []
+    seen_starts: set[int] = set()
+    for idx, match in enumerate(matches):
+        row = match.group(0)
+        if not any(keyword in row for keyword in ("이자율", "이율", "금리", "InterestRate", "interestrate")):
+            continue
+        start_idx = max(0, idx - 8)
+        end_idx = min(len(matches), idx + 9)
+        start = matches[start_idx].start()
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
+        windows.append((start, "\n".join(item.group(0) for item in matches[start_idx:end_idx])))
+    return windows
+
+
 def borrowing_section_for_table(text: str, table_start: int, table_text: str) -> str:
     section = note_section_for_context(table_text)
     if section:
@@ -998,6 +1099,27 @@ def borrowing_section_for_table(text: str, table_start: int, table_text: str) ->
 def is_borrowing_table_text(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     return any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "사채", "회사채", "borrow", "debt", "bond"))
+
+
+def has_borrowing_keyword(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    return any(
+        keyword in compact
+        for keyword in (
+            "차입금",
+            "단기차입",
+            "장기차입",
+            "유동성장기차입",
+            "사채",
+            "회사채",
+            "연이자율",
+            "이자율",
+            "borrow",
+            "debt",
+            "bond",
+            "interestrate",
+        )
+    )
 
 
 def is_table_rate_row(cells: list[str]) -> bool:
@@ -1514,11 +1636,6 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
         seen_contexts.add(key)
         candidates.append((line, amount))
 
-    total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
-    if total_candidates:
-        selected_line, selected_amount = max(total_candidates, key=lambda item: item[1])
-        return selected_amount, selected_amount, "차입금/사채 주석 합계/총계 행 우선", [selected_line]
-
     statement_candidates = [(line, amount) for line, amount in candidates if is_statement_borrowing_row(line)]
     if statement_candidates:
         by_category: dict[str, tuple[BorrowingLine, int]] = {}
@@ -1530,6 +1647,11 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
         amount_sum = sum(amount for _, amount in selected)
         max_amount = max((amount for _, amount in selected), default=0)
         return amount_sum, max_amount, "차입금/사채 주석 항목 우선", [line for line, _ in selected]
+
+    total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
+    if total_candidates:
+        selected_line, selected_amount = max(total_candidates, key=lambda item: item[1])
+        return selected_amount, selected_amount, "차입금/사채 주석 합계/총계 행 사용", [selected_line]
 
     selected: list[tuple[BorrowingLine, int]] = []
     seen_amount_keys: set[tuple[str, int]] = set()
@@ -1550,6 +1672,13 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
                 financial_amount,
                 financial_amount,
                 f"주석 합산액 {amount_sum:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과대하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
+        if financial_amount > 0 and amount_sum < financial_amount * 0.75:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 합산액 {amount_sum:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과소하여 재무상태표 API 사용",
                 [financial_line] if financial_line else [],
             )
         return amount_sum, max_amount, "차입금/사채 주석 항목별 당기 금액 합산", [line for line, _ in selected]
@@ -2096,7 +2225,7 @@ def interest_expense_amount_index(report_name: str, amount_count: int) -> int:
     if amount_count <= 1:
         return 0
     compact = re.sub(r"\s+", "", report_name)
-    if "분기보고서" in compact or "반기보고서" in compact:
+    if "반기보고서" in compact:
         return 1
     return 0
 
