@@ -26,7 +26,7 @@ from xml.etree import ElementTree
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
-BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공"]
+BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공", "이자비용", "금융원가"]
 DISPLAY_KEYWORDS = [
     "전환사채",
     "신주인수권부사채",
@@ -76,6 +76,7 @@ class BorrowingLine:
     receipt_date: str
     receipt_no: str
     keyword: str
+    section: str
     interest_rates: list[float]
     amounts: list[int]
     amount_unit: str
@@ -242,6 +243,7 @@ class DartClient:
             report.receipt_date,
             report.receipt_no,
             "재무제표API",
+            "재무상태표 API",
             [],
             [total],
             "백만원",
@@ -297,14 +299,19 @@ class DartClient:
         files = self.get_document_texts(report.receipt_no)
         rows: list[BorrowingLine] = []
         for source_file, text in files:
-            for line_no, context, amount_unit in extract_text_records(text):
+            for line_no, context, amount_unit, section in extract_text_records(text):
                 if not context:
                     continue
-                keyword = display_keyword_for_context(context)
+                keyword = display_keyword_for_context(context, section)
                 if not keyword:
                     continue
                 rates = extract_rate_values(context)
                 amounts = extract_amount_values(context)
+                if note_section_for_context(context) and not rates and not amounts:
+                    continue
+                max_amount = max((abs(a) for a in amounts), default=0)
+                if keyword == NOTE_INTEREST_EXPENSE_KEYWORD:
+                    max_amount = extract_amount_after_interest_expense_label(context, amount_unit) or max_amount
                 rows.append(
                     BorrowingLine(
                         report.corp_name,
@@ -312,10 +319,11 @@ class DartClient:
                         report.receipt_date,
                         report.receipt_no,
                         keyword,
+                        section,
                         rates,
                         amounts,
                         amount_unit,
-                        max((abs(a) for a in amounts), default=0),
+                        max_amount,
                         Path(source_file).name or f"{report.receipt_no}.xml",
                         line_no,
                         context[:1200],
@@ -515,7 +523,10 @@ def is_financial_borrowing_account(account: str) -> bool:
 
 def is_exact_interest_expense_account(account: str) -> bool:
     compact = re.sub(r"\s+", "", account)
-    return compact in {"이자비용", "차입금이자비용", "사채이자비용"} or "상각후원가측정금융부채이자비용" in compact
+    return (
+        compact in {"이자비용", "차입금이자비용", "사채이자비용", "기타금융부채이자비용", "차입/금융부채이자비용"}
+        or "상각후원가측정금융부채이자비용" in compact
+    )
 
 
 def is_finance_cost_account(account: str) -> bool:
@@ -528,13 +539,14 @@ def clean_context(value: str) -> str:
     return normalize_text(value)
 
 
-def display_keyword_for_context(text: str) -> str:
+def display_keyword_for_context(text: str, section: str = "") -> str:
+    if section == "금융수익 및 금융비용 주석":
+        return NOTE_INTEREST_EXPENSE_KEYWORD if is_borrowing_interest_expense_context(text) else ""
+    if section == "차입금/사채 주석" and is_borrowing_interest_expense_context(text):
+        return ""
+
     compact = re.sub(r"\s+", "", text)
-    if (
-        "상각후원가측정금융부채이자비용" in compact
-        and "기타금융부채이자비용" not in compact
-        and "리스부채" not in compact
-    ):
+    if is_borrowing_interest_expense_context(text):
         return NOTE_INTEREST_EXPENSE_KEYWORD
     for keyword in DISPLAY_KEYWORDS:
         if keyword in compact:
@@ -542,7 +554,7 @@ def display_keyword_for_context(text: str) -> str:
     return ""
 
 
-def extract_text_records(text: str) -> list[tuple[int, str, str]]:
+def extract_text_records(text: str) -> list[tuple[int, str, str, str]]:
     raw_records: list[tuple[int, int, str]] = []
     seen: set[str] = set()
 
@@ -564,14 +576,32 @@ def extract_text_records(text: str) -> list[tuple[int, str, str]]:
             raw_records.append((line_start, line_no, context))
             seen.add(context)
 
-    records: list[tuple[int, str, str]] = []
+    records: list[tuple[int, str, str, str]] = []
     current_unit = ""
+    current_section = ""
     for _, line_no, context in sorted(raw_records, key=lambda item: item[0]):
+        section = note_section_for_context(context)
+        if section:
+            current_section = section
         detected_unit = detect_amount_unit(context)
         if detected_unit:
             current_unit = detected_unit
-        records.append((line_no, context, current_unit))
+        records.append((line_no, context, current_unit, current_section))
     return records
+
+
+def note_section_for_context(text: str) -> str:
+    normalized = normalize_text(text)
+    compact = re.sub(r"\s+", "", normalized)
+    if not re.match(r"^\d{1,3}\.", compact):
+        return ""
+    title = re.sub(r"^\d{1,3}\.", "", compact)
+    title = re.sub(r"\([^)]*\)$", "", title)
+    if title in {"차입금", "사채"}:
+        return "차입금/사채 주석"
+    if title in {"금융수익및금융비용", "금융수익및금융원가"}:
+        return "금융수익 및 금융비용 주석"
+    return ""
 
 
 def detect_amount_unit(text: str) -> str:
@@ -658,6 +688,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         report_lines = by_receipt.get(report.receipt_no, [])
         comparison_rate_lines = [line for line in report_lines if is_comparison_rate_context(line.context)]
         test_lines = [line for line in report_lines if not is_comparison_rate_context(line.context)]
+        borrowing_context_lines = [line for line in test_lines if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD]
         target_rate_lines = [line for line in test_lines if is_valid_borrowing_rate_context(line.context)]
         avg_borrowing_rate_lines = [line for line in comparison_rate_lines if is_average_borrowing_rate_context(line.context)]
         wacc_lines = [line for line in comparison_rate_lines if is_wacc_context(line.context)]
@@ -678,10 +709,6 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         amount_diff = amount_sum - yoy_amount_sum if yoy_amount_sum is not None else None
         amount_change = amount_diff / yoy_amount_sum if amount_diff is not None and yoy_amount_sum not in (None, 0) else None
         amount_comparison_label = f"전년동기 {report_period_label(yoy_report)}" if yoy_report else "전년동기 비교대상 없음"
-        special_bond_mention_count = sum(1 for line in test_lines if is_special_bond_context(line.context))
-        special_bond_amount = calculate_special_bond_amount(test_lines, amount_sum)
-        special_bond_ratio = special_bond_amount / amount_sum if amount_sum else None
-        special_bond_memo = special_bond_review_memo(special_bond_mention_count, special_bond_amount)
         min_rate = min(rates) if rates else None
         avg_rate = sum(rates) / len(rates) if rates else None
         max_rate = max(rates) if rates else None
@@ -724,8 +751,6 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         caution_reasons: list[str] = []
         if amount_change is not None and abs(amount_change) >= 0.30:
             caution_reasons.append(f"전년동기 대비 검출금액합계가 {amount_change:.2%} 변동하여 30% 기준을 초과했습니다.")
-        if special_bond_ratio is not None and special_bond_ratio > 0.30:
-            caution_reasons.append(f"전환사채/신주인수권부사채 등 특수사채 비중이 {special_bond_ratio:.2%}로 30%를 초과했습니다.")
         caution_status = "주의요망" if caution_reasons else ""
         caution_reason = " ".join(caution_reasons)
 
@@ -735,7 +760,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "report_name": report.report_name,
                 "receipt_date": report.receipt_date,
                 "receipt_no": report.receipt_no,
-                "context_count": len(test_lines),
+                "context_count": len(borrowing_context_lines),
                 "rate_count": len(rates),
                 "benchmark_type": benchmark_label,
                 "benchmark_count": len(benchmark_rates),
@@ -746,9 +771,6 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "amount_comparison_label": amount_comparison_label,
                 "amount_diff": amount_diff,
                 "amount_change": amount_change,
-                "special_bond_amount": special_bond_amount,
-                "special_bond_ratio": special_bond_ratio,
-                "special_bond_memo": special_bond_memo,
                 "amount_unit": amount_unit,
                 "min_rate": min_rate,
                 "avg_rate": avg_rate,
@@ -949,21 +971,113 @@ def extract_special_bond_amount_from_report_context(line: BorrowingLine) -> int:
 
 
 def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpense | None:
-    candidates: list[int] = []
+    candidates: list[tuple[BorrowingLine, int]] = []
+    seen_contexts: set[str] = set()
     for line in lines:
-        compact = re.sub(r"\s+", "", line.context)
-        if "상각후원가측정금융부채이자비용" not in compact:
+        if not is_borrowing_interest_expense_context(line.context):
             continue
-        if "기타금융부채이자비용" in compact or "리스부채" in compact:
+        if line.context in seen_contexts:
             continue
-        amount = extract_current_amount(line)
+        amount = extract_interest_expense_amount(line)
         if amount is not None and amount > 0:
-            candidates.append(amount)
+            candidates.append((line, amount))
+            seen_contexts.add(line.context)
     if not candidates:
         return None
-    amount = max(candidates)
+
+    groups: list[list[tuple[BorrowingLine, int]]] = []
+    for line, amount in sorted(candidates, key=lambda item: (item[0].source_file, item[0].line_no)):
+        if not groups:
+            groups.append([(line, amount)])
+            continue
+        prev_line = groups[-1][-1][0]
+        if line.source_file == prev_line.source_file and 0 <= line.line_no - prev_line.line_no <= 8:
+            groups[-1].append((line, amount))
+        else:
+            groups.append([(line, amount)])
+
+    group_sums = [interest_expense_group_amount(group)[0] for group in groups]
+    largest_sum = max(group_sums)
+    selected_group = next(group for group, total in zip(groups, group_sums) if total >= largest_sum * 0.5)
+    amount, used_total_row = interest_expense_group_amount(selected_group)
+
+    if used_total_row:
+        memo = "주석 금융원가 표의 차입 관련 이자비용 총계 행 사용"
+    elif len(selected_group) == 1:
+        memo = "주석 금융원가 표의 차입 관련 이자비용 사용"
+    else:
+        memo = f"주석 금융원가 표의 차입 관련 이자비용 {len(selected_group)}개 항목 합산"
     receipt_no = lines[0].receipt_no if lines else ""
-    return FinancialExpense(receipt_no, amount, "상각후원가 측정 금융부채 이자비용", "주석 금융원가 표의 차입 관련 이자비용 사용")
+    return FinancialExpense(receipt_no, amount, "차입/금융부채 이자비용", memo)
+
+
+def interest_expense_group_amount(group: list[tuple[BorrowingLine, int]]) -> tuple[int, bool]:
+    amounts = [amount for _, amount in group]
+    if len(amounts) >= 2:
+        for amount in sorted(amounts, reverse=True):
+            others = amounts.copy()
+            others.remove(amount)
+            if sum(others) and abs(amount - sum(others)) <= 1:
+                return amount, True
+    return sum(amounts), False
+
+
+def extract_interest_expense_amount(line: BorrowingLine) -> int | None:
+    compact_context = re.sub(r"\s+", "", line.context)
+    amount = extract_amount_after_interest_expense_label(line.context, line.amount_unit)
+    if amount is not None:
+        return amount
+    if "이자비용" in compact_context and len([value for value in line.amounts if abs(value) > 0]) == 1:
+        return extract_current_amount(line)
+    return extract_current_amount(line)
+
+
+def extract_amount_after_interest_expense_label(text: str, unit: str) -> int | None:
+    compact_unit = re.sub(r"\s+", "", unit or "")
+    label_patterns = (
+        r"이자비용\s*\(\s*금융원가\s*\)",
+        r"이자비용\s*\(\s*금융비용\s*\)",
+        r"상각후원가\s*측정\s*금융부채\s*이자비용",
+        r"기타\s*금융부채\s*이자비용",
+        r"차입금\s*이자비용",
+        r"사채\s*이자비용",
+        r"금융부채\s*이자비용",
+    )
+    amount_pattern = r"\(?-?\d{1,3}(?:,\d{3})+\)?"
+    for label_pattern in label_patterns:
+        for match in re.finditer(label_pattern, text):
+            tail = text[match.end() : match.end() + 160]
+            amount_match = re.search(amount_pattern, tail)
+            if not amount_match:
+                continue
+            raw = amount_match.group(0)
+            negative = raw.startswith("(") and raw.endswith(")")
+            value = int(raw.strip("()").replace(",", ""))
+            if negative:
+                value = -abs(value)
+            value = abs(value)
+            return normalize_amount_to_million(value, compact_unit)
+    return None
+
+
+def is_borrowing_interest_expense_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if "이자비용" not in compact:
+        return False
+    if any(keyword in compact for keyword in ("리스부채", "확정급여", "순확정", "충당부채", "복구충당", "계약부채")):
+        return False
+    exact_phrases = (
+        "상각후원가측정금융부채이자비용",
+        "기타금융부채이자비용",
+        "차입금이자비용",
+        "사채이자비용",
+        "금융부채이자비용",
+        "이자비용(금융원가)",
+        "이자비용(금융비용)",
+    )
+    if any(phrase in compact for phrase in exact_phrases):
+        return True
+    return any(keyword in compact for keyword in ("차입금", "사채", "금융부채", "금융원가", "금융비용"))
 
 
 def is_borrowing_amount_context(text: str) -> bool:
@@ -1226,6 +1340,27 @@ def extract_actual_interest(text: str) -> float | None:
 
 
 def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLine], tests: list[dict]) -> None:
+    borrowing_filter_lines = [line for line in lines if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD]
+    interest_expense_lines = [line for line in lines if line.keyword == NOTE_INTEREST_EXPENSE_KEYWORD]
+    filter_headers = ["회사명", "보고서명", "접수일", "접수번호", "키워드", "주석구분", "이자율", "금액후보", "금액단위", "최대금액", "원문파일", "줄번호", "문맥"]
+
+    def filter_row(line: BorrowingLine) -> list:
+        return [
+            line.corp_name,
+            line.report_name,
+            line.receipt_date,
+            line.receipt_no,
+            line.keyword,
+            line.section,
+            format_rates(line.interest_rates),
+            ", ".join(str(amount) for amount in line.amounts),
+            line.amount_unit,
+            line.max_amount,
+            line.source_file,
+            line.line_no,
+            line.context,
+        ]
+
     sheets = [
         (
             "정기보고서목록",
@@ -1235,25 +1370,15 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
         ),
         (
             "차입금필터링",
-            ["회사명", "보고서명", "접수일", "접수번호", "키워드", "이자율", "금액후보", "금액단위", "최대금액", "원문파일", "줄번호", "문맥"],
-            [
-                [
-                    line.corp_name,
-                    line.report_name,
-                    line.receipt_date,
-                    line.receipt_no,
-                    line.keyword,
-                    format_rates(line.interest_rates),
-                    ", ".join(str(amount) for amount in line.amounts),
-                    line.amount_unit,
-                    line.max_amount,
-                    line.source_file,
-                    line.line_no,
-                    line.context,
-                ]
-                for line in lines
-            ],
-            {9: 2, 11: 2},
+            filter_headers,
+            [filter_row(line) for line in borrowing_filter_lines],
+            {10: 2, 12: 2},
+        ),
+        (
+            "이자비용필터링",
+            filter_headers,
+            [filter_row(line) for line in interest_expense_lines],
+            {10: 2, 12: 2},
         ),
         (
             "이자율오버롤테스트",
@@ -1270,7 +1395,7 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "이자비용차이",
                 "이자비용계정",
                 "평균차입금",
-                "평균차입이자율",
+                "검출평균이자율",
                 "최저차입이자율",
                 "최고차입이자율",
                 "대상기간(개월)",
@@ -1278,15 +1403,12 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                 "증감비교대상",
                 "전년동기대비변동률",
                 "전년동기대비증감",
-                "특수사채금액",
-                "특수사채비중",
                 "주의여부",
                 "주의사유",
                 "금액단위",
                 "금액산정방식",
                 "차입금문맥수",
                 "이자비용산정메모",
-                "특수사채검토메모",
             ],
             [
                 [
@@ -1310,19 +1432,16 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
                     t["amount_comparison_label"],
                     t["amount_change"],
                     t["amount_diff"],
-                    t["special_bond_amount"],
-                    t["special_bond_ratio"],
                     t["caution_status"],
                     t["caution_reason"],
                     t["amount_unit"],
                     t["amount_method"],
                     t["context_count"],
                     t["interest_expense_memo"],
-                    t["special_bond_memo"],
                 ]
                 for t in tests
             ],
-            {7: 3, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 3, 15: 3, 17: 2, 19: 3, 20: 2, 21: 2, 22: 3, 27: 2},
+            {7: 3, 8: 2, 9: 2, 10: 2, 12: 2, 13: 3, 14: 3, 15: 3, 17: 2, 19: 3, 20: 2, 25: 2},
         ),
     ]
 
