@@ -309,9 +309,13 @@ class DartClient:
                 amounts = extract_amount_values(context)
                 if note_section_for_context(context) and not rates and not amounts:
                     continue
-                max_amount = max((abs(a) for a in amounts), default=0)
                 if keyword == NOTE_INTEREST_EXPENSE_KEYWORD:
-                    max_amount = extract_amount_after_interest_expense_label(context, amount_unit) or max_amount
+                    interest_amount = extract_amount_after_interest_expense_label(context, amount_unit)
+                    if interest_amount is None:
+                        continue
+                    max_amount = interest_amount
+                else:
+                    max_amount = max((abs(a) for a in amounts), default=0)
                 rows.append(
                     BorrowingLine(
                         report.corp_name,
@@ -329,6 +333,7 @@ class DartClient:
                         context[:1200],
                     )
                 )
+            rows.extend(extract_interest_expense_lines_from_document(report, source_file, text))
         return rows
 
     def get_document_texts(self, receipt_no: str) -> list[tuple[str, str]]:
@@ -590,6 +595,51 @@ def extract_text_records(text: str) -> list[tuple[int, str, str, str]]:
     return records
 
 
+def extract_interest_expense_lines_from_document(report: DartReport, source_file: str, text: str) -> list[BorrowingLine]:
+    plain = clean_context(text)
+    rows: list[BorrowingLine] = []
+    seen_contexts: set[str] = set()
+    section_pattern = re.compile(r"\d{1,3}\.\s*금융수익\s*(?:및|과)\s*금융(?:비용|원가)")
+    for section_match in section_pattern.finditer(plain):
+        start = section_match.start()
+        next_match = re.search(r"\s\d{1,3}\.\s*[가-힣A-Za-z]", plain[section_match.end() :])
+        end = section_match.end() + next_match.start() if next_match else min(len(plain), start + 6000)
+        section_text = plain[start:end]
+        unit = detect_amount_unit(section_text)
+        for amount_match in re.finditer(r"이자비용\s+(\(?-?\d{1,3}(?:,\d{3})+\)?)", section_text):
+            context_start = max(0, amount_match.start() - 220)
+            context_end = min(len(section_text), amount_match.end() + 420)
+            context = section_text[context_start:context_end].strip()
+            if context in seen_contexts:
+                continue
+            seen_contexts.add(context)
+            raw = amount_match.group(1)
+            negative = raw.startswith("(") and raw.endswith(")")
+            amount = int(raw.strip("()").replace(",", ""))
+            if negative:
+                amount = -abs(amount)
+            amount = normalize_amount_to_million(abs(amount), unit)
+            line_no = text.count("\n", 0, max(0, text.find(section_text[:80]))) + 1
+            rows.append(
+                BorrowingLine(
+                    report.corp_name,
+                    report.report_name,
+                    report.receipt_date,
+                    report.receipt_no,
+                    NOTE_INTEREST_EXPENSE_KEYWORD,
+                    "금융수익 및 금융비용 주석",
+                    [],
+                    [amount],
+                    unit,
+                    amount,
+                    Path(source_file).name or f"{report.receipt_no}.xml",
+                    line_no,
+                    context[:1200],
+                )
+            )
+    return rows
+
+
 def note_section_for_context(text: str) -> str:
     normalized = normalize_text(text)
     compact = re.sub(r"\s+", "", normalized)
@@ -597,9 +647,9 @@ def note_section_for_context(text: str) -> str:
         return ""
     title = re.sub(r"^\d{1,3}\.", "", compact)
     title = re.sub(r"\([^)]*\)$", "", title)
-    if title in {"차입금", "사채"}:
+    if title.startswith("차입금") or title.startswith("사채"):
         return "차입금/사채 주석"
-    if title in {"금융수익및금융비용", "금융수익및금융원가"}:
+    if title.startswith(("금융수익및금융비용", "금융수익과금융비용", "금융수익및금융원가", "금융수익과금융원가")):
         return "금융수익 및 금융비용 주석"
     return ""
 
@@ -1005,6 +1055,8 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
         memo = "주석 금융원가 표의 차입 관련 이자비용 총계 행 사용"
     elif len(selected_group) == 1:
         memo = "주석 금융원가 표의 차입 관련 이자비용 사용"
+    elif all(is_financial_expense_summary_context(line.context) for line, _ in selected_group):
+        memo = "연결/별도 금융비용 주석 후보 중 큰 이자비용 금액 사용"
     else:
         memo = f"주석 금융원가 표의 차입 관련 이자비용 {len(selected_group)}개 항목 합산"
     receipt_no = lines[0].receipt_no if lines else ""
@@ -1019,7 +1071,14 @@ def interest_expense_group_amount(group: list[tuple[BorrowingLine, int]]) -> tup
             others.remove(amount)
             if sum(others) and abs(amount - sum(others)) <= 1:
                 return amount, True
+        if all(is_financial_expense_summary_context(line.context) for line, _ in group):
+            return max(amounts), False
     return sum(amounts), False
+
+
+def is_financial_expense_summary_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return "금융수익" in compact and "금융비용" in compact and "이자비용" in compact and "합계" in compact
 
 
 def extract_interest_expense_amount(line: BorrowingLine) -> int | None:
@@ -1042,6 +1101,7 @@ def extract_amount_after_interest_expense_label(text: str, unit: str) -> int | N
         r"차입금\s*이자비용",
         r"사채\s*이자비용",
         r"금융부채\s*이자비용",
+        r"이자비용",
     )
     amount_pattern = r"\(?-?\d{1,3}(?:,\d{3})+\)?"
     for label_pattern in label_patterns:
