@@ -774,6 +774,14 @@ def interest_judgment_basis(
     return " ".join(parts)
 
 
+def implied_interest_judgment_basis(actual: float, average_balance: float, implied_rate: float, period_months: int) -> str:
+    return (
+        "차입금/사채 행에서 명시 이자율을 충분히 찾지 못해 회사 계상 이자비용으로 역산한 유효이자율을 사용했습니다. "
+        f"역산유효이자율 {implied_rate:.2%} = 실제이자비용 {actual:,.0f}백만원 ÷ 평균차입금 {average_balance:,.0f}백만원 ÷ {period_months}/12. "
+        "역산유효이자율이 0%~30% 범위라 적정으로 분류했습니다."
+    )
+
+
 def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], financial_expenses: dict[str, FinancialExpense] | None = None) -> list[dict]:
     financial_expenses = financial_expenses or {}
     by_receipt: dict[str, list[BorrowingLine]] = {}
@@ -832,11 +840,27 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
             average_borrowing_balance = prev_amount_sum / 2
         else:
             average_borrowing_balance = None
-        period_factor = report_period_months(report) / 12
-        expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
+        period_months = report_period_months(report)
+        period_factor = period_months / 12
         financial_expense = extract_note_interest_expense(report_lines) or financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
         actual_interest_expense = financial_expense.actual_interest_expense
         actual_interest_comparable = actual_interest_expense is not None and is_exact_interest_expense_account(financial_expense.account_name)
+        implied_rate_used = False
+        if (
+            avg_rate is None
+            and actual_interest_comparable
+            and actual_interest_expense is not None
+            and average_borrowing_balance not in (None, 0)
+            and period_factor
+        ):
+            implied_rate = actual_interest_expense / average_borrowing_balance / period_factor
+            if 0 < implied_rate <= 0.30:
+                avg_rate = implied_rate
+                min_rate = implied_rate
+                max_rate = implied_rate
+                implied_rate_used = True
+                benchmark_label = "이자율 미공시(이자비용 역산)"
+        expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
         interest_expense_diff = actual_interest_expense - expected_interest_expense if actual_interest_comparable and expected_interest_expense is not None else None
         interest_expense_error_rate = interest_expense_diff / expected_interest_expense if interest_expense_diff is not None and expected_interest_expense not in (None, 0) else None
         amount_units = sorted({line.amount_unit for line in amount_used_lines if line.max_amount and line.amount_unit})
@@ -846,22 +870,24 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        period_months = report_period_months(report)
         if not has_amount_candidate or average_borrowing_balance in (None, 0):
             judgment = "판단불가"
             if has_amount_candidate:
                 judgment_basis = f"재무상태표 차입금/사채 잔액이 0이고 비교 가능한 전기 잔액이 없어 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
             else:
                 judgment_basis = f"차입금/사채 잔액 후보를 찾지 못해 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
-        elif avg_rate is None:
-            judgment = "판단불가"
-            judgment_basis = "차입금/사채 행에서 이자율 후보가 부족해 예상 이자비용을 산정할 수 없습니다."
         elif actual_interest_expense is None:
             judgment = "판단불가"
             judgment_basis = "재무제표 또는 주석에서 비교 가능한 이자비용 계정을 찾지 못했습니다."
         elif not is_exact_interest_expense_account(financial_expense.account_name):
             judgment = "판단불가"
             judgment_basis = "금융비용 대체값은 외환손익 등 다른 항목이 섞일 수 있어 적정 판정에서 제외했습니다."
+        elif implied_rate_used:
+            judgment = "적정"
+            judgment_basis = implied_interest_judgment_basis(actual_interest_expense, average_borrowing_balance, avg_rate, period_months)
+        elif avg_rate is None:
+            judgment = "판단불가"
+            judgment_basis = "차입금/사채 행에서 이자율 후보가 부족하고, 이자비용 역산 유효이자율도 0%~30% 범위를 벗어나 예상 이자비용을 산정할 수 없습니다."
         elif expected_interest_expense is None:
             judgment = "판단불가"
             judgment_basis = "평균차입금 또는 검출평균이자율이 부족해 예상 이자비용을 산정할 수 없습니다."
