@@ -364,6 +364,7 @@ class DartClient:
                         context[:1200],
                     )
                 )
+            rows.extend(extract_borrowing_table_rate_lines(report, source_file, text))
             rows.extend(extract_interest_expense_lines_from_document(report, source_file, text))
         return rows
 
@@ -840,6 +841,258 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
             line_no,
         )
     return rows
+
+
+def extract_borrowing_table_rate_lines(report: DartReport, source_file: str, text: str) -> list[BorrowingLine]:
+    rows: list[BorrowingLine] = []
+    seen: set[str] = set()
+    for table_match in re.finditer(r"<TABLE\b.*?</TABLE>", text, flags=re.IGNORECASE | re.DOTALL):
+        table_html = table_match.group(0)
+        table_text = clean_context(table_html)
+        section = borrowing_section_for_table(text, table_match.start(), table_text)
+        unit = detect_amount_unit(table_text) or detect_amount_unit(clean_context(text[max(0, table_match.start() - 800) : table_match.start()]))
+        table_rows = parse_table_rows(table_html)
+        rows.extend(borrowing_lines_from_table_rows(report, source_file, text, table_match.start(), table_rows, table_text, section, unit, seen))
+
+    for group_start, group_html in parse_tr_groups(text):
+        table_text = clean_context(group_html)
+        section = borrowing_section_for_table(text, group_start, table_text)
+        unit = detect_amount_unit(table_text) or detect_amount_unit(clean_context(text[max(0, group_start - 800) : group_start]))
+        table_rows = parse_table_rows(group_html)
+        rows.extend(borrowing_lines_from_table_rows(report, source_file, text, group_start, table_rows, table_text, section, unit, seen))
+    return rows
+
+
+def borrowing_lines_from_table_rows(
+    report: DartReport,
+    source_file: str,
+    text: str,
+    table_start: int,
+    table_rows: list[list[str]],
+    table_text: str,
+    section: str,
+    unit: str,
+    seen: set[str],
+) -> list[BorrowingLine]:
+    rows: list[BorrowingLine] = []
+    if not table_rows:
+        return rows
+    if not is_borrowing_note_section(section) and not is_borrowing_table_text(table_text):
+        return rows
+
+    rate_rows = [(idx, cells) for idx, cells in enumerate(table_rows) if is_table_rate_row(cells)]
+    amount_rows = [(idx, cells) for idx, cells in enumerate(table_rows) if is_table_borrowing_amount_row(cells)]
+    if not rate_rows or not amount_rows:
+        return rows
+
+    date_by_col = table_date_values(table_rows)
+    total_cols = table_total_columns(table_rows)
+    for rate_idx, rate_cells in rate_rows:
+        rates_by_col = table_rates_by_column(rate_cells)
+        if not rates_by_col:
+            continue
+        next_rate_idx = min((idx for idx, _ in rate_rows if idx > rate_idx), default=len(table_rows))
+        nearby_amount_rows = [
+            (idx, cells)
+            for idx, cells in amount_rows
+            if rate_idx < idx < next_rate_idx and idx - rate_idx <= 8
+        ]
+        for amount_idx, amount_cells in nearby_amount_rows:
+            label = first_text_cell(amount_cells)
+            if not label:
+                continue
+            for col, amount in table_amounts_by_column(amount_cells, unit).items():
+                if col in total_cols:
+                    continue
+                rates = rates_by_col.get(col)
+                if not rates:
+                    rates = nearest_rate_column_value(rates_by_col, col)
+                if not rates:
+                    continue
+                context_parts = [section or "차입금/사채 주석", label, f"금액 {amount:,}백만원"]
+                context_parts.append("이자율 " + ", ".join(f"{rate:.4%}" for rate in rates))
+                if col in date_by_col:
+                    context_parts.append(" ".join(date_by_col[col]))
+                context = " ".join(context_parts)
+                key = f"{report.receipt_no}:{source_file}:{table_start}:{rate_idx}:{amount_idx}:{col}:{amount}:{rates}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                line_no = text.count("\n", 0, table_start) + 1
+                rows.append(
+                    BorrowingLine(
+                        report.corp_name,
+                        report.report_name,
+                        report.receipt_date,
+                        report.receipt_no,
+                        display_keyword_for_context(label, section) or borrowing_table_keyword(label),
+                        section or "차입금/사채 주석",
+                        rates,
+                        [amount],
+                        "백만원",
+                        amount,
+                        Path(source_file).name or f"{report.receipt_no}.xml",
+                        line_no,
+                        context[:1200],
+                    )
+                )
+    return rows
+
+
+def parse_table_rows(table_html: str) -> list[list[str]]:
+    parsed_rows: list[list[str]] = []
+    for row_match in re.finditer(r"<TR\b.*?</TR>", table_html, flags=re.IGNORECASE | re.DOTALL):
+        cells: list[str] = []
+        for cell_match in re.finditer(r"<T[HDE]\b([^>]*)>(.*?)</T[HDE]>", row_match.group(0), flags=re.IGNORECASE | re.DOTALL):
+            attrs = cell_match.group(1)
+            colspan_match = re.search(r"COLSPAN\s*=\s*[\"']?(\d+)", attrs, flags=re.IGNORECASE)
+            colspan = int(colspan_match.group(1)) if colspan_match else 1
+            value = clean_context(cell_match.group(2))
+            cells.extend([value] * max(1, min(colspan, 20)))
+        if any(cells):
+            parsed_rows.append(cells)
+    return parsed_rows
+
+
+def parse_tr_groups(text: str) -> list[tuple[int, str]]:
+    matches = list(re.finditer(r"<TR\b.*?</TR>", text, flags=re.IGNORECASE | re.DOTALL))
+    groups: list[tuple[int, str]] = []
+    current_start: int | None = None
+    current_parts: list[str] = []
+    previous_end = 0
+    for match in matches:
+        gap = clean_context(text[previous_end : match.start()])
+        starts_new_group = current_start is None or bool(
+            re.search(r"(?:^|\s)(?:당기|당분기|당반기|전기|전분기|전반기)말?\s*(?:\(단위|$)", gap)
+        )
+        if starts_new_group:
+            if current_start is not None and current_parts:
+                groups.append((current_start, "\n".join(current_parts)))
+            current_start = match.start()
+            current_parts = []
+        current_parts.append(match.group(0))
+        previous_end = match.end()
+    if current_start is not None and current_parts:
+        groups.append((current_start, "\n".join(current_parts)))
+    return groups
+
+
+def borrowing_section_for_table(text: str, table_start: int, table_text: str) -> str:
+    section = note_section_for_context(table_text)
+    if section:
+        return section
+    prefix = clean_context(text[max(0, table_start - 2500) : table_start])
+    headings = re.findall(r"(?:^|\s)(\d{1,3}\.\s*[가-힣A-Za-z0-9()/ㆍ·\s]{1,80})", prefix)
+    for heading in reversed(headings):
+        section = note_section_for_context(heading.strip())
+        if section:
+            return section
+    if is_borrowing_table_text(table_text):
+        return "차입금/사채 주석"
+    return ""
+
+
+def is_borrowing_table_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "사채", "회사채", "borrow", "debt", "bond"))
+
+
+def is_table_rate_row(cells: list[str]) -> bool:
+    row_text = " ".join(cells)
+    compact = re.sub(r"\s+", "", row_text)
+    return any(keyword in compact for keyword in ("이자율", "이율", "금리", "연이자율", "interestrate")) and bool(table_rates_by_column(cells))
+
+
+def is_table_borrowing_amount_row(cells: list[str]) -> bool:
+    label = first_text_cell(cells)
+    compact = re.sub(r"\s+", "", label)
+    if not compact:
+        return False
+    if any(keyword in compact for keyword in ("이자율", "이율", "금리", "할인", "할증", "차감", "기술", "기초통화", "상환일", "발행일")):
+        return False
+    return any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "유동성장기차입", "사채", "회사채", "은행차입"))
+
+
+def first_text_cell(cells: list[str]) -> str:
+    for cell in cells:
+        if re.search(r"[가-힣A-Za-z]", cell):
+            return cell
+    return cells[0] if cells else ""
+
+
+def borrowing_table_keyword(label: str) -> str:
+    compact = re.sub(r"\s+", "", label)
+    for keyword in ("단기차입금", "장기차입금", "유동성장기차입금", "회사채", "사채", "차입금"):
+        if keyword in compact:
+            return keyword
+    return "차입금"
+
+
+def table_rates_by_column(cells: list[str]) -> dict[int, list[float]]:
+    rates_by_col: dict[int, list[float]] = {}
+    for idx, cell in enumerate(cells):
+        rates = extract_rate_values("이자율 " + cell)
+        rates = [rate for rate in rates if is_reasonable_interest_rate(rate)]
+        if rates:
+            rates_by_col[idx] = rates
+    return rates_by_col
+
+
+def table_amounts_by_column(cells: list[str], unit: str) -> dict[int, int]:
+    amounts: dict[int, int] = {}
+    for idx, cell in enumerate(cells):
+        if re.search(r"[가-힣A-Za-z]", cell):
+            continue
+        value = parse_table_amount_cell(cell)
+        if value is None or value <= 0:
+            continue
+        amount = normalize_amount_to_million(value, unit)
+        if amount > 0:
+            amounts[idx] = amount
+    return amounts
+
+
+def nearest_rate_column_value(values_by_col: dict[int, list[float]], col: int) -> list[float] | None:
+    if not values_by_col:
+        return None
+    nearest = min(values_by_col, key=lambda idx: abs(idx - col))
+    if abs(nearest - col) <= 3:
+        return values_by_col[nearest]
+    return None
+
+
+def parse_table_amount_cell(cell: str) -> int | None:
+    matches = re.findall(r"\(?-?\d{1,3}(?:,\d{3})+\)?|\(?-?\d{1,12}\)?", cell)
+    if not matches:
+        return None
+    values: list[int] = []
+    for raw in matches:
+        value = parse_signed_amount(raw)
+        if value is not None:
+            values.append(abs(value))
+    return max(values) if values else None
+
+
+def table_date_values(table_rows: list[list[str]]) -> dict[int, list[str]]:
+    values: dict[int, list[str]] = {}
+    for cells in table_rows:
+        label = first_text_cell(cells)
+        if not any(keyword in label for keyword in ("발행일", "만기", "상환일")):
+            continue
+        for idx, cell in enumerate(cells):
+            if extract_dates(cell):
+                values.setdefault(idx, []).append(f"{label} {cell}")
+    return values
+
+
+def table_total_columns(table_rows: list[list[str]]) -> set[int]:
+    cols: set[int] = set()
+    for cells in table_rows[:8]:
+        for idx, cell in enumerate(cells):
+            compact = re.sub(r"\s+", "", cell)
+            if "합계" in compact or "총계" in compact:
+                cols.add(idx)
+    return cols
 
 
 def note_section_for_context(text: str) -> str:
@@ -1979,11 +2232,11 @@ def is_non_interest_percent_context(text: str) -> bool:
 
 
 def is_reasonable_interest_rate(rate: float) -> bool:
-    return 0 < rate <= 0.30
+    return 0 < rate <= 0.50
 
 
 def estimation_interest_rates(line: BorrowingLine) -> list[float]:
-    if any(rate > 0.30 for rate in line.interest_rates):
+    if any(rate > 0.50 for rate in line.interest_rates):
         return []
     return [rate for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
 
@@ -2077,9 +2330,9 @@ def interest_rate_weight_months(text: str, default_months: int) -> int:
 
 
 def representative_interest_rate_for_weighting(line: BorrowingLine) -> float | None:
-    if any(rate > 0.30 for rate in line.interest_rates):
+    if any(rate > 0.50 for rate in line.interest_rates):
         return None
-    rates = [rate for rate in line.interest_rates if 0 <= rate <= 0.30]
+    rates = [rate for rate in line.interest_rates if 0 <= rate <= 0.50]
     if not rates or not any(rate > 0 for rate in rates):
         return None
     return (min(rates) + max(rates)) / 2
@@ -2157,7 +2410,7 @@ def extract_rate_values(text: str) -> list[float]:
                 value = float(raw)
             except ValueError:
                 continue
-            if 0 < value <= 0.30 and value not in rates:
+            if is_reasonable_interest_rate(value) and value not in rates:
                 rates.append(value)
     return rates
 
