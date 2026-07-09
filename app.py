@@ -725,6 +725,30 @@ def interest_test_from_note(note: BorrowingNote) -> InterestTest:
     return InterestTest(note.corp_name, note.report_name, note.receipt_no, amount, rate, expected, actual, error, result)
 
 
+def interest_judgment_basis(
+    expected: float,
+    actual: float,
+    diff: float | None,
+    error_rate: float | None,
+    average_balance: float,
+    avg_rate: float,
+    period_months: int,
+    verdict_text: str,
+) -> str:
+    parts = [
+        verdict_text,
+        f"예상이자비용 {expected:,.0f}백만원 = 평균차입금 {average_balance:,.0f}백만원 × 검출평균이자율 {avg_rate:.2%} × {period_months}/12.",
+        f"실제이자비용 {actual:,.0f}백만원",
+    ]
+    if diff is not None:
+        parts.append(f"차이 {diff:,.0f}백만원")
+    if error_rate is not None:
+        parts.append(f"오차율 {error_rate:.2%}")
+        if abs(error_rate) > 1:
+            parts.append("오차율이 100%를 초과하므로 차입금 잔액 또는 이자율 추출값 원문 확인이 필요합니다.")
+    return " ".join(parts)
+
+
 def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], financial_expenses: dict[str, FinancialExpense] | None = None) -> list[dict]:
     financial_expenses = financial_expenses or {}
     by_receipt: dict[str, list[BorrowingLine]] = {}
@@ -776,7 +800,10 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
-        average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None else amount_sum
+        if amount_sum > 0:
+            average_borrowing_balance = ((prev_amount_sum + amount_sum) / 2) if prev_amount_sum is not None and prev_amount_sum > 0 else amount_sum
+        else:
+            average_borrowing_balance = None
         period_factor = report_period_months(report) / 12
         expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
         financial_expense = extract_note_interest_expense(report_lines) or financial_expenses.get(report.receipt_no, FinancialExpense(report.receipt_no, None, "", "재무제표 이자비용 정보 없음"))
@@ -791,7 +818,11 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         elif len(amount_units) > 1:
             amount_unit = "혼합: " + ", ".join(amount_units)
 
-        if avg_rate is None:
+        period_months = report_period_months(report)
+        if amount_sum <= 0 or average_borrowing_balance in (None, 0):
+            judgment = "판단불가"
+            judgment_basis = f"차입금/사채 잔액 후보를 찾지 못해 예상 이자비용을 산정할 수 없습니다. 금액산정방식: {amount_method}"
+        elif avg_rate is None:
             judgment = "판단불가"
             judgment_basis = "차입금/사채 행에서 이자율 후보가 부족해 예상 이자비용을 산정할 수 없습니다."
         elif actual_interest_expense is None:
@@ -800,12 +831,33 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         elif not is_exact_interest_expense_account(financial_expense.account_name):
             judgment = "판단불가"
             judgment_basis = "금융비용 대체값은 외환손익 등 다른 항목이 섞일 수 있어 적정 판정에서 제외했습니다."
+        elif expected_interest_expense is None:
+            judgment = "판단불가"
+            judgment_basis = "평균차입금 또는 검출평균이자율이 부족해 예상 이자비용을 산정할 수 없습니다."
         elif interest_expense_error_rate is not None and abs(interest_expense_error_rate) <= 0.05:
             judgment = "적정"
-            judgment_basis = "예상 이자비용과 회사 계상 이자비용의 차이가 ±5% 이내입니다."
+            judgment_basis = interest_judgment_basis(
+                expected_interest_expense,
+                actual_interest_expense,
+                interest_expense_diff,
+                interest_expense_error_rate,
+                average_borrowing_balance,
+                avg_rate,
+                period_months,
+                "예상 이자비용과 회사 계상 이자비용의 차이가 ±5% 이내입니다.",
+            )
         else:
             judgment = "확인필요"
-            judgment_basis = "예상 이자비용과 회사 계상 이자비용의 차이가 ±5%를 초과합니다."
+            judgment_basis = interest_judgment_basis(
+                expected_interest_expense,
+                actual_interest_expense,
+                interest_expense_diff,
+                interest_expense_error_rate,
+                average_borrowing_balance,
+                avg_rate,
+                period_months,
+                "예상 이자비용과 회사 계상 이자비용의 차이가 ±5%를 초과합니다.",
+            )
 
         result = judgment
 
@@ -855,7 +907,8 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
                 "caution_reason": caution_reason,
             }
         )
-        prev_amount_sum = amount_sum
+        if amount_sum > 0:
+            prev_amount_sum = amount_sum
 
     return rows
 
