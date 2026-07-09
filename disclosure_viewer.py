@@ -247,16 +247,7 @@ class DartClient:
         self.api_key = api_key.strip()
 
     def resolve_corp(self, corp_code: str, stock_code: str, company_name: str) -> CorpInfo | None:
-        if corp_code.strip():
-            return CorpInfo(corp_code.strip(), company_name.strip() or corp_code.strip(), stock_code.strip())
-
         corps = self.get_corp_codes()
-        if stock_code.strip():
-            normalized = stock_code.strip().zfill(6)
-            for corp in corps:
-                if corp.stock_code == normalized:
-                    return corp
-
         needle = company_name.strip().lower()
         if needle:
             exact = [corp for corp in corps if corp.corp_name.lower() == needle]
@@ -265,16 +256,27 @@ class DartClient:
             matches = [corp for corp in corps if needle in corp.corp_name.lower()]
             if matches:
                 return sorted(matches, key=lambda c: (not bool(c.stock_code), len(c.corp_name), c.corp_name))[0]
+
+        if corp_code.strip():
+            return CorpInfo(corp_code.strip(), company_name.strip() or corp_code.strip(), stock_code.strip())
+
+        if stock_code.strip():
+            normalized = stock_code.strip().zfill(6)
+            for corp in corps:
+                if corp.stock_code == normalized:
+                    return corp
         return None
 
     def search_corps(self, company_name: str, stock_code: str = "", limit: int = 80) -> list[dict]:
         corps = self.get_corp_codes()
-        if stock_code.strip():
+        needle = company_name.strip().lower()
+        if needle:
+            matches = [corp for corp in corps if needle in corp.corp_name.lower()]
+        elif stock_code.strip():
             normalized = stock_code.strip().zfill(6)
             matches = [corp for corp in corps if corp.stock_code == normalized]
         else:
-            needle = company_name.strip().lower()
-            matches = [corp for corp in corps if needle and needle in corp.corp_name.lower()]
+            matches = []
         matches = sorted(matches, key=lambda c: (c.corp_name.lower() != company_name.strip().lower(), not bool(c.stock_code), len(c.corp_name), c.corp_name))
         return [{"corpCode": c.corp_code, "corpName": c.corp_name, "stockCode": c.stock_code} for c in matches[:limit]]
 
@@ -661,6 +663,9 @@ HTML_PAGE = r"""
       $("disclosureRows").innerHTML = "";
       const data = await post("/api/disclosures", payload());
       if (!data.ok) { status(data.message); return; }
+      $("companyName").value = data.corp.corp_name || $("companyName").value;
+      $("stockCode").value = data.corp.stock_code || "";
+      $("corpCode").value = data.corp.corp_code || "";
       status(`${data.corp.corp_name} 공시 ${data.count}건을 불러왔습니다.`);
       $("disclosureRows").innerHTML = data.items.map(x => `
         <tr>
