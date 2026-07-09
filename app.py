@@ -1618,7 +1618,8 @@ class DartOtApp(tk.Tk):
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
-        self.company_text: tk.Text | None = None
+        self.company_var = tk.StringVar(value="삼성전자")
+        self.company_entry: tk.Entry | None = None
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 9))
@@ -1729,9 +1730,9 @@ class DartOtApp(tk.Tk):
         container = ttk.Frame(parent, style="Panel.TFrame")
         container.pack(fill="x", pady=(0, 8))
         ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
-        self.company_text = tk.Text(
+        self.company_entry = tk.Entry(
             container,
-            height=1,
+            textvariable=self.company_var,
             width=20,
             font=self.entry_font,
             relief="solid",
@@ -1739,29 +1740,21 @@ class DartOtApp(tk.Tk):
             highlightthickness=1,
             highlightbackground="#cbd5e1",
             highlightcolor="#0f766e",
-            wrap="none",
-            undo=False,
+            insertwidth=1,
         )
-        self.company_text.insert("1.0", "삼성전자")
-        self.company_text.pack(fill="x", ipady=3)
-        self.company_text.bind("<Return>", lambda _event: "break")
-        self.company_text.bind("<Tab>", lambda _event: self.focus_next_company_widget())
+        self.company_entry.pack(fill="x", ipady=5)
+        self.company_entry.bind("<Return>", lambda _event: self.search_company())
 
     def focus_next_company_widget(self):
-        if self.company_text is not None:
-            self.company_text.tk_focusNext().focus()
+        if self.company_entry is not None:
+            self.company_entry.tk_focusNext().focus()
         return "break"
 
     def get_company_name(self) -> str:
-        if self.company_text is None:
-            return ""
-        return self.company_text.get("1.0", "end-1c").strip()
+        return self.company_var.get().strip()
 
     def set_company_name(self, value: str) -> None:
-        if self.company_text is None:
-            return
-        self.company_text.delete("1.0", "end")
-        self.company_text.insert("1.0", value)
+        self.company_var.set(value)
 
     def search_company(self) -> None:
         api_key = self.api_key_var.get().strip()
