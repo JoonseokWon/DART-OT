@@ -105,6 +105,12 @@ class FinancialExpense:
     memo: str
 
 
+@dataclass(frozen=True, slots=True)
+class BorrowingMovementEstimate:
+    average_balance: float
+    method: str
+
+
 @dataclass
 class InterestTest:
     corp_name: str
@@ -531,6 +537,93 @@ def beginning_borrowing_amount(
     return None, "평균차입금: 전기말 재무상태표 차입잔액 미검출"
 
 
+def movement_adjusted_average_borrowing_balance(
+    beginning_amount: int | None,
+    ending_amount: int,
+    lines: list[BorrowingLine],
+) -> BorrowingMovementEstimate | None:
+    if beginning_amount is None or beginning_amount <= 0 or ending_amount < 0:
+        return None
+
+    estimates: list[tuple[float, BorrowingMovementEstimate]] = []
+    for source_file, source_lines in borrowing_movement_lines_by_source(lines).items():
+        increases = sum(amount for amount in borrowing_movement_amounts(source_lines) if amount > 0)
+        decreases = sum(abs(amount) for amount in borrowing_movement_amounts(source_lines) if amount < 0)
+        if increases == 0 and decreases == 0:
+            continue
+
+        implied_ending = beginning_amount + increases - decreases
+        difference = abs(implied_ending - ending_amount)
+        tolerance = max(5_000, max(beginning_amount, ending_amount) * 0.20)
+        if difference > tolerance:
+            continue
+
+        average_balance = beginning_amount + (increases * 0.5) - (decreases * 0.5)
+        if average_balance <= 0:
+            continue
+        method = (
+            "평균차입금: 전기말 재무상태표 차입잔액에 당기 차입금 변동내역을 반기 평균 가정으로 반영"
+            f" (증가 {increases:,}백만원, 감소 {decreases:,}백만원, 출처 {source_file})"
+        )
+        estimates.append((difference, BorrowingMovementEstimate(average_balance, method)))
+
+    if not estimates:
+        return None
+    return min(estimates, key=lambda item: item[0])[1]
+
+
+def borrowing_movement_lines_by_source(lines: list[BorrowingLine]) -> dict[str, list[BorrowingLine]]:
+    grouped: dict[str, list[BorrowingLine]] = {}
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        if not is_borrowing_movement_context(line.context):
+            continue
+        key = (line.source_file, normalize_text(line.context))
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(line.source_file, []).append(line)
+    return grouped
+
+
+def borrowing_movement_amounts(lines: list[BorrowingLine]) -> list[int]:
+    amounts: list[int] = []
+    for line in lines:
+        sign = borrowing_movement_sign(line.context)
+        if sign == 0:
+            continue
+        values = [abs(value) for value in line.amounts if abs(value) > 0]
+        if not values:
+            continue
+        amount = normalize_movement_amount_to_million(values[0], line.amount_unit)
+        if amount > 0:
+            amounts.append(sign * amount)
+    return amounts
+
+
+def is_borrowing_movement_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if any(keyword in compact for keyword in ("할인발행차금", "담보", "주주총회", "동등배당", "정관")):
+        return False
+    return borrowing_movement_sign(text) != 0 and bool(re.search(r"\d{1,3}(?:,\d{3})+", text))
+
+
+def borrowing_movement_sign(text: str) -> int:
+    compact = re.sub(r"\s+", "", text)
+    if re.search(r"(?:단기차입금|장기차입금|차입금|사채)의(?:감소|상환)", compact):
+        return -1
+    if re.search(r"(?:단기차입금|장기차입금|차입금|사채)의(?:증가|발행)", compact) or "신규차입" in compact:
+        return 1
+    return 0
+
+
+def normalize_movement_amount_to_million(value: int, unit: str) -> int:
+    compact = re.sub(r"\s+", "", unit or "")
+    if compact in ("", "원") and value >= 100_000:
+        return round(value / 1_000)
+    return normalize_amount_to_million(value, compact)
+
+
 def parse_dart_amount(value: str) -> int | None:
     cleaned = str(value or "").replace(",", "").strip()
     if not cleaned or cleaned == "-":
@@ -642,7 +735,7 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
         amount = int(raw_amount.strip("()").replace(",", ""))
         if negative:
             amount = -abs(amount)
-        amount = normalize_amount_to_million(abs(amount), unit)
+        amount = normalize_interest_amount_to_million(abs(amount), unit)
         rows.append(
             BorrowingLine(
                 report.corp_name,
@@ -684,7 +777,7 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
         context_end = min(len(plain), amount_match.end() + 420)
         context = plain[context_start:context_end].strip()
         unit_context = plain[max(0, amount_match.start() - 1500) : amount_match.end() + 200]
-        unit = detect_amount_unit(unit_context) or detect_amount_unit(plain)
+        unit = detect_amount_unit(unit_context)
         source_pos = text.find(plain[max(0, amount_match.start() - 40) : amount_match.start() + 40])
         line_no = text.count("\n", 0, source_pos if source_pos >= 0 else 0) + 1
         append_interest_line(
@@ -838,7 +931,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         target_rate_lines = [line for line in test_lines if is_valid_borrowing_rate_context(line.context)]
         avg_borrowing_rate_lines = [line for line in comparison_rate_lines if is_average_borrowing_rate_context(line.context)]
         wacc_lines = [line for line in comparison_rate_lines if is_wacc_context(line.context)]
-        rates = [rate for line in target_rate_lines for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
+        rates = [rate for line in target_rate_lines for rate in estimation_interest_rates(line)]
         avg_borrowing_rates = [rate for line in avg_borrowing_rate_lines for rate in line.interest_rates]
         wacc_rates = [rate for line in wacc_lines for rate in line.interest_rates]
         benchmark_rates = avg_borrowing_rates
@@ -863,7 +956,11 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
         beginning_amount, average_method = beginning_borrowing_amount(period_key, amount_cache, latest_report_by_period)
-        if amount_sum > 0 and beginning_amount is not None and beginning_amount > 0:
+        movement_estimate = movement_adjusted_average_borrowing_balance(beginning_amount, amount_sum, test_lines)
+        if movement_estimate is not None:
+            average_borrowing_balance = movement_estimate.average_balance
+            average_method = movement_estimate.method
+        elif amount_sum > 0 and beginning_amount is not None and beginning_amount > 0:
             average_borrowing_balance = (beginning_amount + amount_sum) / 2
         elif amount_sum > 0:
             average_borrowing_balance = amount_sum
@@ -1046,7 +1143,11 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
         if not is_borrowing_amount_context(line.context):
             continue
         amount = extract_current_amount(line)
-        if amount is None or amount <= 0:
+        if amount is None:
+            continue
+        if amount < 0:
+            continue
+        if amount == 0 and not is_current_period_zero_amount(line.context):
             continue
         key = normalize_text(line.context)
         if key in seen_contexts:
@@ -1090,10 +1191,16 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
 
 
 def extract_current_amount(line: BorrowingLine) -> int | None:
+    if is_current_period_zero_amount(line.context):
+        return 0
     values = [abs(value) for value in line.amounts if abs(value) > 0]
     if not values:
         return None
     return normalize_amount_to_million(values[0], line.amount_unit)
+
+
+def is_current_period_zero_amount(text: str) -> bool:
+    return bool(re.search(r"(?:총차입금|차입금(?:및사채)?|단기차입금|장기차입금|사채)\s*[-－]\s*\d{1,3}(?:,\d{3})+", text))
 
 
 def normalize_amount_to_million(value: int, unit: str) -> int:
@@ -1105,6 +1212,13 @@ def normalize_amount_to_million(value: int, unit: str) -> int:
     if "억원" in compact:
         return value * 100
     return value
+
+
+def normalize_interest_amount_to_million(value: int, unit: str) -> int:
+    compact = re.sub(r"\s+", "", unit or "")
+    if compact in ("", "원") and value >= 100_000:
+        return round(value / 1_000)
+    return normalize_amount_to_million(value, compact)
 
 
 def calculate_special_bond_amount(lines: list[BorrowingLine], reference_amount: int | None = None) -> int:
@@ -1216,6 +1330,8 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
     for line in lines:
         if not is_borrowing_interest_expense_context(line.context):
             continue
+        if is_explanatory_interest_expense_context(line.context):
+            continue
         if line.context in seen_contexts:
             continue
         amount = extract_interest_expense_amount(line)
@@ -1224,6 +1340,16 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
             seen_contexts.add(line.context)
     if not candidates:
         return None
+
+    total_candidates = [(line, amount) for line, amount in candidates if is_total_interest_expense_candidate(line.context)]
+    if total_candidates:
+        selected_line, amount = max(total_candidates, key=lambda item: finance_cost_interest_candidate_score(item[0], item[1]))
+        return FinancialExpense(
+            selected_line.receipt_no,
+            amount,
+            "차입/금융부채 이자비용",
+            "금융비용 주석의 당기 이자비용 우선 사용",
+        )
 
     groups: list[list[tuple[BorrowingLine, int]]] = []
     for line, amount in sorted(candidates, key=lambda item: (item[0].source_file, item[0].line_no)):
@@ -1260,33 +1386,199 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
 
 
 def note_interest_disclosure_comparison(lines: list[BorrowingLine]) -> tuple[int, int, int, float] | None:
-    finance_expense_amounts: list[int] = []
-    amortized_liability_amounts: list[int] = []
+    component_comparisons: list[tuple[int, int, tuple[int, int, int, float]]] = []
     seen_contexts: set[str] = set()
+    context_index = 0
     for line in lines:
         if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD:
+            continue
+        if is_explanatory_interest_expense_context(line.context):
             continue
         if line.context in seen_contexts:
             continue
         seen_contexts.add(line.context)
-        amount = extract_interest_expense_amount(line)
-        if amount is None or amount <= 0:
+        component_comparison = note_interest_component_comparison(line)
+        if component_comparison is not None:
+            component_comparisons.append((interest_context_period_score(line.context), -context_index, component_comparison))
+        context_index += 1
+
+    if component_comparisons:
+        return max(component_comparisons, key=lambda item: (item[0], item[1]))[2]
+    return None
+
+
+def is_explanatory_interest_expense_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return "이자비용" in compact and any(
+        keyword in compact
+        for keyword in (
+            "이자비용절감",
+            "절감을위한",
+            "조기상환",
+            "상환에따라",
+        )
+    )
+
+
+def is_total_interest_expense_candidate(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if is_amortized_financial_liability_interest(text):
+        return False
+    if any(keyword in compact for keyword in ("기타금융부채이자비용", "차입금이자비용", "사채이자비용", "금융부채이자비용")):
+        return False
+    return "이자비용" in compact and any(keyword in compact for keyword in ("금융비용", "금융원가", "금융수익과금융비용", "금융수익및금융비용"))
+
+
+def interest_expense_candidate_score(line: BorrowingLine, amount: int) -> tuple[int, int, int, int, int]:
+    period_score = interest_context_period_score(line.context)
+    consolidated_score = consolidated_context_score(line.context)
+    full_context_score = 1 if line.line_no == 1 else 0
+    return period_score, consolidated_score, -line.line_no, full_context_score, -amount
+
+
+def finance_cost_interest_candidate_score(line: BorrowingLine, amount: int) -> tuple[int, int, int, int, int, int, int]:
+    compact = re.sub(r"\s+", "", line.context)
+    finance_cost_note_score = 1 if any(keyword in compact for keyword in ("금융비용의내역", "금융원가의내역")) else 0
+    exact_interest_row_score = 1 if any(keyword in compact for keyword in ("이자비용(금융비용)", "이자비용(금융원가)", "구분당기전기이자비용")) else 0
+    standalone_note_score = 1 if "연결회사" not in compact and "연결회사는" not in compact else 0
+    source_detail_score = 1 if "_" in line.source_file else 0
+    period_score = interest_context_period_score(line.context)
+    full_context_score = 1 if line.line_no == 1 else 0
+    return (
+        finance_cost_note_score,
+        exact_interest_row_score,
+        standalone_note_score,
+        source_detail_score,
+        period_score,
+        full_context_score,
+        -amount,
+    )
+
+
+def consolidated_context_score(text: str) -> int:
+    compact = re.sub(r"\s+", "", text)
+    if "별도" in compact:
+        return 0
+    if "연결" in compact:
+        return 2
+    return 1
+
+
+def note_interest_component_comparison(line: BorrowingLine) -> tuple[int, int, int, float] | None:
+    total_matches = extract_interest_total_amount_matches(line.context, line.amount_unit)
+    if not total_matches:
+        return None
+
+    comparisons: list[tuple[int, int, tuple[int, int, int, float]]] = []
+    for match_index, (start, totals) in enumerate(total_matches):
+        end = total_matches[match_index + 1][0] if match_index + 1 < len(total_matches) else len(line.context)
+        segment = line.context[start:end]
+        components = extract_interest_component_amount_groups(segment, line.amount_unit)
+        if len(components) < 2:
             continue
-        if is_amortized_financial_liability_interest(line.context):
-            amortized_liability_amounts.append(amount)
-        elif is_financial_expense_summary_context(line.context) or line.section == "금융수익 및 금융비용 주석":
-            finance_expense_amounts.append(amount)
+        index = interest_amount_column_index(line.context, totals)
+        if index >= len(totals):
+            continue
+        component_values = [amounts[index] for amounts in components if index < len(amounts)]
+        if len(component_values) < 2:
+            continue
 
-    if not finance_expense_amounts or not amortized_liability_amounts:
+        reference = totals[index]
+        actual = sum(component_values)
+        if reference <= 0 or abs(reference - actual) > max(1, reference * 0.05):
+            continue
+        diff = actual - reference
+        error_rate = diff / reference
+        comparison = (reference, actual, diff, error_rate)
+        comparisons.append((interest_context_period_score_at(line.context, start), -match_index, comparison))
+    if not comparisons:
         return None
+    return max(comparisons, key=lambda item: (item[0], item[1]))[2]
 
-    reference = max(finance_expense_amounts)
-    actual = max(amortized_liability_amounts)
-    if reference <= 0:
-        return None
-    diff = actual - reference
-    error_rate = diff / reference
-    return reference, actual, diff, error_rate
+
+def interest_amount_column_index(text: str, totals: list[int]) -> int:
+    compact = re.sub(r"\s+", "", text)
+    if len(totals) >= 2 and "3개월" in compact and "누적" in compact:
+        return 1
+    return 0
+
+
+def interest_context_period_score(text: str) -> int:
+    compact = re.sub(r"\s+", "", text)
+    total_index = compact.find("이자비용")
+    prefix = compact[:total_index] if total_index >= 0 else compact
+    return interest_period_prefix_score(prefix)
+
+
+def interest_context_period_score_at(text: str, total_index: int) -> int:
+    prefix = re.sub(r"\s+", "", text[:total_index])
+    return interest_period_prefix_score(prefix)
+
+
+def interest_period_prefix_score(prefix: str) -> int:
+    markers: list[tuple[int, bool]] = []
+    for marker in ("당분기", "당반기", "당기"):
+        marker_index = prefix.rfind(marker)
+        if marker_index >= 0:
+            markers.append((marker_index, True))
+    for marker in ("전분기", "전반기", "전기", "전년"):
+        marker_index = prefix.rfind(marker)
+        if marker_index >= 0:
+            markers.append((marker_index, False))
+    if markers:
+        return 2 if max(markers)[1] else 0
+    return 1
+
+
+def extract_interest_total_amounts(text: str, unit: str) -> list[int]:
+    return [amount for _, amounts in extract_interest_total_amount_matches(text, unit) for amount in amounts]
+
+
+def extract_interest_total_amount_matches(text: str, unit: str) -> list[tuple[int, list[int]]]:
+    compact_unit = re.sub(r"\s+", "", unit or "")
+    amount_matches: list[tuple[int, list[int]]] = []
+    for match in re.finditer(r"이자비용\s*(?:\(\s*(?:금융원가|금융비용)\s*\))?\s+((?:\(?-?\d{1,3}(?:,\d{3})+\)?\s*){1,3})", text):
+        prefix = text[max(0, match.start() - 24) : match.start()]
+        compact_prefix = re.sub(r"\s+", "", prefix)
+        if any(keyword in compact_prefix for keyword in ("상각후원가", "기타금융부채", "차입금", "사채", "금융부채")):
+            continue
+        amounts = extract_amount_sequence(match.group(1), compact_unit)
+        if amounts:
+            amount_matches.append((match.start(), amounts))
+    return amount_matches
+
+
+def extract_interest_component_amount_groups(text: str, unit: str) -> list[list[int]]:
+    compact_unit = re.sub(r"\s+", "", unit or "")
+    label_patterns = (
+        r"상각후원가\s*(?:측정\s*)?금융부채\s*이자비용",
+        r"기타\s*금융부채\s*이자비용",
+        r"차입금\s*이자비용",
+        r"사채\s*이자비용",
+        r"금융부채\s*이자비용",
+    )
+    groups: list[list[int]] = []
+    seen_groups: set[tuple[int, ...]] = set()
+    amount_sequence = r"((?:\(?-?\d{1,3}(?:,\d{3})+\)?\s*){1,3})"
+    for label_pattern in label_patterns:
+        for match in re.finditer(label_pattern + r"\s+" + amount_sequence, text):
+            amounts = extract_amount_sequence(match.group(1), compact_unit)
+            key = tuple(amounts)
+            if amounts and key not in seen_groups:
+                groups.append(amounts)
+                seen_groups.add(key)
+    return groups
+
+
+def extract_amount_sequence(text: str, unit: str) -> list[int]:
+    values: list[int] = []
+    for raw in re.findall(r"\(?-?\d{1,3}(?:,\d{3})+\)?", text):
+        negative = raw.startswith("(") and raw.endswith(")")
+        value = int(raw.strip("()").replace(",", ""))
+        if negative:
+            value = -abs(value)
+        values.append(normalize_interest_amount_to_million(abs(value), unit))
+    return values
 
 
 def interest_expense_group_amount(group: list[tuple[BorrowingLine, int]]) -> tuple[int, bool]:
@@ -1314,7 +1606,7 @@ def is_amortized_financial_liability_interest(text: str) -> bool:
 
 def extract_interest_expense_amount(line: BorrowingLine) -> int | None:
     compact_context = re.sub(r"\s+", "", line.context)
-    amount = extract_amount_after_interest_expense_label(line.context, line.amount_unit)
+    amount = extract_amount_after_interest_expense_label(line.context, line.amount_unit, line.report_name)
     if amount is not None:
         return amount
     if "이자비용" in compact_context and len([value for value in line.amounts if abs(value) > 0]) == 1:
@@ -1322,7 +1614,7 @@ def extract_interest_expense_amount(line: BorrowingLine) -> int | None:
     return extract_current_amount(line)
 
 
-def extract_amount_after_interest_expense_label(text: str, unit: str) -> int | None:
+def extract_amount_after_interest_expense_label(text: str, unit: str, report_name: str = "") -> int | None:
     compact_unit = re.sub(r"\s+", "", unit or "")
     label_patterns = (
         r"이자비용\s*\(\s*금융원가\s*\)",
@@ -1338,17 +1630,25 @@ def extract_amount_after_interest_expense_label(text: str, unit: str) -> int | N
     for label_pattern in label_patterns:
         for match in re.finditer(label_pattern, text):
             tail = text[match.end() : match.end() + 160]
-            amount_match = re.search(amount_pattern, tail)
-            if not amount_match:
+            amount_matches = re.findall(amount_pattern, tail)
+            if not amount_matches:
                 continue
-            raw = amount_match.group(0)
+            raw = amount_matches[interest_expense_amount_index(report_name, len(amount_matches))]
             negative = raw.startswith("(") and raw.endswith(")")
             value = int(raw.strip("()").replace(",", ""))
             if negative:
                 value = -abs(value)
             value = abs(value)
-            return normalize_amount_to_million(value, compact_unit)
+            return normalize_interest_amount_to_million(value, compact_unit)
     return None
+
+
+def interest_expense_amount_index(report_name: str, amount_count: int) -> int:
+    match = re.search(r"\(\d{4}\.(\d{2})\)", report_name)
+    month = int(match.group(1)) if match else 0
+    if month in (6, 9) and amount_count >= 2:
+        return 1
+    return 0
 
 
 def is_borrowing_interest_expense_context(text: str) -> bool:
@@ -1377,6 +1677,8 @@ def is_borrowing_amount_context(text: str) -> bool:
         return False
     if not re.search(r"\d{1,3}(?:,\d{3})+", text):
         return False
+    if is_current_period_zero_amount(text):
+        return True
     if not any(keyword in compact for keyword in ("장부금액", "액면금액", "권면총액", "미상환잔액", "유동성", "비유동성")):
         return False
     exclusion_keywords = (
@@ -1533,6 +1835,12 @@ def is_non_interest_percent_context(text: str) -> bool:
 
 def is_reasonable_interest_rate(rate: float) -> bool:
     return 0 < rate <= 0.30
+
+
+def estimation_interest_rates(line: BorrowingLine) -> list[float]:
+    if any(rate > 0.30 for rate in line.interest_rates):
+        return []
+    return [rate for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
 
 
 def has_rate_pattern(text: str) -> bool:
