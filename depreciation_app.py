@@ -93,7 +93,7 @@ def run_depreciation_report(payload: dict) -> dict:
         return app.fail("회사 정보를 찾지 못했습니다. 종목코드 또는 회사명을 다시 확인해 주세요.")
 
     now_year = datetime.now().year
-    begin_year = int(payload.get("beginYear") or now_year - 9)
+    begin_year = int(payload.get("beginYear") or now_year - 4)
     end_year = int(payload.get("endYear") or now_year)
 
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
@@ -378,7 +378,7 @@ def save_depreciation_workbook(path: Path, reports: list[app.DartReport], lines:
         ),
     ]
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", app.content_types())
+        archive.writestr("[Content_Types].xml", app.content_types(len(sheets)))
         archive.writestr("_rels/.rels", app.root_rels())
         archive.writestr("xl/workbook.xml", app.workbook_xml([s[0] for s in sheets]))
         archive.writestr("xl/_rels/workbook.xml.rels", app.workbook_rels(len(sheets)))
@@ -445,7 +445,7 @@ class DepreciationApp(tk.Tk):
         self.company_var = tk.StringVar(value="삼성전자")
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
-        self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 9))
+        self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
         self.end_year_var = tk.StringVar(value=str(datetime.now().year))
         self.status_var = tk.StringVar(value="DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요.")
         self.summary_var = tk.StringVar(value="정기보고서: -    감가상각 관련 공시: -    오버롤 테스트: -")

@@ -105,6 +105,16 @@ class FinancialExpense:
     memo: str
 
 
+@dataclass
+class ExtractionIssue:
+    corp_name: str
+    report_name: str
+    receipt_date: str
+    receipt_no: str
+    step: str
+    message: str
+
+
 @dataclass(frozen=True, slots=True)
 class BorrowingMovementEstimate:
     average_balance: float
@@ -190,27 +200,37 @@ class DartClient:
     def get_reports(self, corp_code: str, begin_year: int, end_year: int) -> list[DartReport]:
         reports: list[DartReport] = []
         for year in range(begin_year, end_year + 1):
-            data = self._get_json(
-                "https://opendart.fss.or.kr/api/list.json",
-                {
-                    "crtfc_key": self.api_key,
-                    "corp_code": corp_code,
-                    "bgn_de": f"{year}0101",
-                    "end_de": f"{year}1231",
-                    "pblntf_ty": "A",
-                    "page_count": "100",
-                },
-            )
-            for item in data.get("list", []):
-                reports.append(
-                    DartReport(
-                        item.get("corp_name", ""),
-                        item.get("report_nm", ""),
-                        item.get("rcept_dt", ""),
-                        item.get("rcept_no", ""),
-                        item.get("stock_code", ""),
-                    )
+            page_no = 1
+            while True:
+                data = self._get_json(
+                    "https://opendart.fss.or.kr/api/list.json",
+                    {
+                        "crtfc_key": self.api_key,
+                        "corp_code": corp_code,
+                        "bgn_de": f"{year}0101",
+                        "end_de": f"{year}1231",
+                        "pblntf_ty": "A",
+                        "page_count": "100",
+                        "page_no": str(page_no),
+                    },
                 )
+                status = data.get("status")
+                if status not in (None, "000", "013"):
+                    raise RuntimeError(f"DART list.json failed: {status} {data.get('message', '')}".strip())
+                for item in data.get("list", []):
+                    reports.append(
+                        DartReport(
+                            item.get("corp_name", ""),
+                            item.get("report_nm", ""),
+                            item.get("rcept_dt", ""),
+                            item.get("rcept_no", ""),
+                            item.get("stock_code", ""),
+                        )
+                    )
+                total_page = int(data.get("total_page") or 1)
+                if page_no >= total_page:
+                    break
+                page_no += 1
         return sorted(reports, key=lambda r: (r.receipt_date, r.report_name), reverse=True)
 
     def get_financial_statement_rows(self, corp_code: str, report: DartReport) -> list[dict]:
@@ -387,34 +407,35 @@ def run_report(payload: dict) -> dict:
         return fail("회사 정보를 찾지 못했습니다. 종목코드 또는 회사명을 다시 확인해 주세요.")
 
     now_year = datetime.now().year
-    begin_year = int(payload.get("beginYear") or now_year - 9)
+    begin_year = int(payload.get("beginYear") or now_year - 4)
     end_year = int(payload.get("endYear") or now_year)
 
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
     borrowing_lines: list[BorrowingLine] = []
     revenues: dict[str, int] = {}
+    issues: list[ExtractionIssue] = []
     for report in reports:
         try:
             financial_line = client.extract_financial_borrowing_line(corp.corp_code, report)
             if financial_line is not None:
                 borrowing_lines.append(financial_line)
-        except Exception:
-            pass
+        except Exception as exc:
+            issues.append(extraction_issue(report, "financial_statement", exc))
         try:
             revenue = client.extract_revenue(corp.corp_code, report)
             if revenue is not None:
                 revenues[report.receipt_no] = revenue
-        except Exception:
-            pass
+        except Exception as exc:
+            issues.append(extraction_issue(report, "revenue", exc))
         try:
             borrowing_lines.extend(client.extract_borrowing_lines(report))
-        except Exception:
-            continue
+        except Exception as exc:
+            issues.append(extraction_issue(report, "borrowing_note", exc))
 
     tests = build_overall_tests(reports, borrowing_lines, revenues)
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-    save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests)
+    save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests, issues)
 
     return {
         "ok": True,
@@ -423,11 +444,23 @@ def run_report(payload: dict) -> dict:
         "reportCount": len(reports),
         "noteCount": len(borrowing_lines),
         "testCount": len(tests),
+        "issueCount": len(issues),
     }
 
 
 def fail(message: str) -> dict:
     return {"ok": False, "message": message, "file": None, "reportCount": 0, "noteCount": 0, "testCount": 0}
+
+
+def extraction_issue(report: DartReport, step: str, exc: Exception) -> ExtractionIssue:
+    return ExtractionIssue(
+        report.corp_name,
+        report.report_name,
+        report.receipt_date,
+        report.receipt_no,
+        step,
+        f"{type(exc).__name__}: {exc}",
+    )
 
 
 def decode_dart_document(data: bytes) -> str:
@@ -833,10 +866,10 @@ def note_section_for_context(text: str) -> str:
 
 def detect_amount_unit(text: str) -> str:
     compact = re.sub(r"\s+", "", text)
-    match = re.search(r"단위[:：]?(백만원|천원|억원|원|USD|천USD|백만USD|미화천달러|미화백만달러)", compact, flags=re.IGNORECASE)
+    match = re.search(r"단위[:：]?(십억원|백만원|천원|억원|원|USD|천USD|백만USD|미화천달러|미화백만달러)", compact, flags=re.IGNORECASE)
     if match:
         return match.group(1)
-    for unit in ("백만원", "천원", "억원"):
+    for unit in ("십억원", "백만원", "천원", "억원"):
         if unit in text:
             return unit
     return ""
@@ -983,7 +1016,8 @@ def build_overall_tests(
         else:
             benchmark_label = "평균차입이자율 미공시"
         amount_sum, max_amount, amount_method, amount_used_lines = amount_cache.get(report.receipt_no, (0, 0, "차입금 잔액 후보 없음", []))
-        weighted_rate = weighted_average_interest_rate(target_rate_lines, amount_sum)
+        period_months = report_period_months(report)
+        weighted_rate = weighted_average_interest_rate(target_rate_lines, amount_sum, period_months)
         has_amount_candidate = bool(amount_used_lines)
         period_key = report_period_key(report)
         yoy_report = latest_report_by_period.get((period_key[0] - 1, period_key[1])) if period_key else None
@@ -1013,7 +1047,6 @@ def build_overall_tests(
         else:
             average_borrowing_balance = None
             average_method = "평균차입금: 전기말 및 당기말 차입잔액 부족"
-        period_months = report_period_months(report)
         period_factor = period_months / 12
         revenue = revenues.get(report.receipt_no, 0)
         materiality_threshold = materiality_threshold_from_revenue(revenue) if revenue > 0 else 0
@@ -1242,6 +1275,8 @@ def is_current_period_zero_amount(text: str) -> bool:
 
 def normalize_amount_to_million(value: int, unit: str) -> int:
     compact = re.sub(r"\s+", "", unit or "")
+    if "십억원" in compact:
+        return value * 1_000
     if "천원" in compact:
         return round(value / 1_000)
     if compact == "원":
@@ -1253,8 +1288,12 @@ def normalize_amount_to_million(value: int, unit: str) -> int:
 
 def normalize_interest_amount_to_million(value: int, unit: str) -> int:
     compact = re.sub(r"\s+", "", unit or "")
-    if compact in ("", "원") and value >= 100_000:
-        return round(value / 1_000)
+    if compact == "":
+        return value
+    if compact == "원":
+        if value >= 10_000_000:
+            return round(value / 1_000_000)
+        return value
     return normalize_amount_to_million(value, compact)
 
 
@@ -1730,6 +1769,11 @@ def extract_amount_after_interest_expense_label(text: str, unit: str, report_nam
 
 
 def interest_expense_amount_index(report_name: str, amount_count: int) -> int:
+    if amount_count <= 1:
+        return 0
+    compact = re.sub(r"\s+", "", report_name)
+    if "분기보고서" in compact or "반기보고서" in compact:
+        return 1
     return 0
 
 
@@ -1935,9 +1979,10 @@ def estimation_interest_rates(line: BorrowingLine) -> list[float]:
     return [rate for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
 
 
-def weighted_average_interest_rate(lines: list[BorrowingLine], reference_amount: int) -> float | None:
+def weighted_average_interest_rate(lines: list[BorrowingLine], reference_amount: int, default_months: int) -> float | None:
     weighted_sum = 0.0
-    weight_total = 0
+    weight_total = 0.0
+    amount_total = 0
     seen_contexts: set[str] = set()
     for line in lines:
         key = normalize_text(line.context)
@@ -1950,13 +1995,30 @@ def weighted_average_interest_rate(lines: list[BorrowingLine], reference_amount:
         amount = extract_current_amount(line)
         if amount is None or amount <= 0:
             continue
-        weighted_sum += line_rate * amount
-        weight_total += amount
+        months = interest_rate_weight_months(line.context, default_months)
+        weighted_sum += line_rate * amount * months
+        weight_total += amount * months
+        amount_total += amount
     if not weight_total:
         return None
-    if reference_amount > 0 and weight_total < reference_amount * 0.5:
+    if reference_amount > 0 and amount_total < reference_amount * 0.5:
         return None
     return weighted_sum / weight_total
+
+
+def interest_rate_weight_months(text: str, default_months: int) -> int:
+    compact = re.sub(r"\s+", "", text)
+    month_matches = [int(value) for value in re.findall(r"(\d{1,2})개월", compact)]
+    month_matches = [value for value in month_matches if 1 <= value <= 12]
+    if month_matches:
+        return max(month_matches)
+    if "당분기" in compact or "3개월" in compact:
+        return 3
+    if "당반기" in compact or "6개월" in compact:
+        return 6
+    if "3분기" in compact or "9개월" in compact:
+        return 9
+    return max(1, min(default_months, 12))
 
 
 def representative_interest_rate_for_weighting(line: BorrowingLine) -> float | None:
@@ -2127,7 +2189,14 @@ def note_reference(line: BorrowingLine) -> str:
     return f"연결재무제표 주석 {reference} 참조"
 
 
-def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLine], tests: list[dict]) -> None:
+def save_workbook(
+    path: Path,
+    reports: list[DartReport],
+    lines: list[BorrowingLine],
+    tests: list[dict],
+    issues: list[ExtractionIssue] | None = None,
+) -> None:
+    issues = issues or []
     financial_statement_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
     borrowing_filter_lines = [
         line
@@ -2229,9 +2298,17 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
             {5: 2, 6: 2, 7: 2, 9: 2, 10: 3, 11: 3, 12: 3, 13: 2, 14: 2, 16: 3, 17: 2, 20: 2},
         ),
     ]
+    sheets.append(
+        (
+            "추출오류",
+            ["회사명", "보고서명", "접수일", "접수번호", "단계", "오류"],
+            [[i.corp_name, i.report_name, i.receipt_date, i.receipt_no, i.step, i.message] for i in issues],
+            {},
+        )
+    )
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types())
+        archive.writestr("[Content_Types].xml", content_types(len(sheets)))
         archive.writestr("_rels/.rels", root_rels())
         archive.writestr("xl/workbook.xml", workbook_xml([s[0] for s in sheets]))
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels(len(sheets)))
@@ -2280,8 +2357,21 @@ def column_name(index: int) -> str:
     return name
 
 
-def content_types() -> str:
-    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"""
+def content_types(sheet_count: int = 3) -> str:
+    worksheet_overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for i in range(1, sheet_count + 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        f"{worksheet_overrides}"
+        "</Types>"
+    )
 
 
 def root_rels() -> str:
@@ -2408,7 +2498,7 @@ class DartOtApp(tk.Tk):
         self.company_entry: tk.Entry | None = None
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
-        self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 9))
+        self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
         self.end_year_var = tk.StringVar(value=str(datetime.now().year))
         self.status_var = tk.StringVar(value="DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요.")
         self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
@@ -2755,7 +2845,7 @@ HTML_PAGE = r"""
       <div id="status" class="status">조회 조건을 입력하고 실행해 주세요.</div>
       <div id="link"></div>
       <div class="steps">
-        <div class="step">1. 최근 10년치 정기보고서 목록을 수집합니다.</div>
+        <div class="step">1. 최근 5년치 정기보고서 목록을 수집합니다.</div>
         <div class="step">2. 차입금, 사채, 이자율 관련 주석을 필터링합니다.</div>
         <div class="step">3. ±5% 기준으로 이자율 오버롤 테스트 결과를 산출합니다.</div>
       </div>
