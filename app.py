@@ -247,13 +247,13 @@ class DartClient:
 
         total = sum(amount for _, amount in selected)
         detail = ", ".join(f"{name} {amount:,}" for name, amount in selected)
-        context = f"재무제표API 차입금 합계 {total:,}백만원 ({detail})"
+        context = f"재무상태표 차입잔액 합계 {total:,}백만원 ({detail})"
         return BorrowingLine(
             report.corp_name,
             report.report_name,
             report.receipt_date,
             report.receipt_no,
-            "재무제표API",
+            "재무상태표 차입잔액",
             "재무상태표 API",
             [],
             [total],
@@ -611,6 +611,35 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
     plain = clean_context(text)
     rows: list[BorrowingLine] = []
     seen_contexts: set[str] = set()
+
+    def append_interest_line(section: str, context: str, raw_amount: str, unit: str, line_no: int) -> None:
+        context = context.strip()
+        if not context or context in seen_contexts:
+            return
+        seen_contexts.add(context)
+        negative = raw_amount.startswith("(") and raw_amount.endswith(")")
+        amount = int(raw_amount.strip("()").replace(",", ""))
+        if negative:
+            amount = -abs(amount)
+        amount = normalize_amount_to_million(abs(amount), unit)
+        rows.append(
+            BorrowingLine(
+                report.corp_name,
+                report.report_name,
+                report.receipt_date,
+                report.receipt_no,
+                NOTE_INTEREST_EXPENSE_KEYWORD,
+                section,
+                [],
+                [amount],
+                unit,
+                amount,
+                Path(source_file).name or f"{report.receipt_no}.xml",
+                line_no,
+                context[:1200],
+            )
+        )
+
     section_pattern = re.compile(r"\d{1,3}\.\s*금융수익\s*(?:및|과)\s*금융(?:비용|원가)")
     for section_match in section_pattern.finditer(plain):
         start = section_match.start()
@@ -622,33 +651,28 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
             context_start = max(0, amount_match.start() - 220)
             context_end = min(len(section_text), amount_match.end() + 420)
             context = section_text[context_start:context_end].strip()
-            if context in seen_contexts:
-                continue
-            seen_contexts.add(context)
             raw = amount_match.group(1)
-            negative = raw.startswith("(") and raw.endswith(")")
-            amount = int(raw.strip("()").replace(",", ""))
-            if negative:
-                amount = -abs(amount)
-            amount = normalize_amount_to_million(abs(amount), unit)
             line_no = text.count("\n", 0, max(0, text.find(section_text[:80]))) + 1
-            rows.append(
-                BorrowingLine(
-                    report.corp_name,
-                    report.report_name,
-                    report.receipt_date,
-                    report.receipt_no,
-                    NOTE_INTEREST_EXPENSE_KEYWORD,
-                    "금융수익 및 금융비용 주석",
-                    [],
-                    [amount],
-                    unit,
-                    amount,
-                    Path(source_file).name or f"{report.receipt_no}.xml",
-                    line_no,
-                    context[:1200],
-                )
-            )
+            append_interest_line("금융수익 및 금융비용 주석", context, raw, unit, line_no)
+
+    liability_pattern = re.compile(
+        r"상각후원가\s*(?:측정\s*)?금융부채\s*:?\s*(?:[^\d.,()]{0,80}?)이자비용\s+(\(?-?\d{1,3}(?:,\d{3})+\)?)"
+    )
+    for amount_match in liability_pattern.finditer(plain):
+        context_start = max(0, amount_match.start() - 220)
+        context_end = min(len(plain), amount_match.end() + 420)
+        context = plain[context_start:context_end].strip()
+        unit_context = plain[max(0, amount_match.start() - 1500) : amount_match.end() + 200]
+        unit = detect_amount_unit(unit_context) or detect_amount_unit(plain)
+        source_pos = text.find(plain[max(0, amount_match.start() - 40) : amount_match.start() + 40])
+        line_no = text.count("\n", 0, source_pos if source_pos >= 0 else 0) + 1
+        append_interest_line(
+            "상각후원가 금융부채 이자비용 주석",
+            context,
+            amount_match.group(1),
+            unit,
+            line_no,
+        )
     return rows
 
 
@@ -921,7 +945,7 @@ def build_overall_tests(reports: list[DartReport], lines: list[BorrowingLine], f
 
 
 def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, str, list[BorrowingLine]]:
-    financial_api_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json" and "재무제표API" in line.context]
+    financial_api_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
     if financial_api_lines:
         selected_line = max(financial_api_lines, key=lambda line: line.max_amount)
         amount = normalize_amount_to_million(selected_line.amounts[0], selected_line.amount_unit) if selected_line.amounts else 0
@@ -1123,12 +1147,18 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
         else:
             groups.append([(line, amount)])
 
-    group_sums = [interest_expense_group_amount(group)[0] for group in groups]
-    largest_sum = max(group_sums)
-    selected_group = next(group for group, total in zip(groups, group_sums) if total >= largest_sum * 0.5)
+    preferred_groups = [group for group in groups if any(is_amortized_financial_liability_interest(line.context) for line, _ in group)]
+    if preferred_groups:
+        selected_group = max(preferred_groups, key=lambda group: interest_expense_group_amount(group)[0])
+    else:
+        group_sums = [interest_expense_group_amount(group)[0] for group in groups]
+        largest_sum = max(group_sums)
+        selected_group = next(group for group, total in zip(groups, group_sums) if total >= largest_sum * 0.5)
     amount, used_total_row = interest_expense_group_amount(selected_group)
 
-    if used_total_row:
+    if any(is_amortized_financial_liability_interest(line.context) for line, _ in selected_group):
+        memo = "상각후원가 금융부채 표의 이자비용 우선 사용"
+    elif used_total_row:
         memo = "주석 금융원가 표의 차입 관련 이자비용 총계 행 사용"
     elif len(selected_group) == 1:
         memo = "주석 금융원가 표의 차입 관련 이자비용 사용"
@@ -1156,6 +1186,11 @@ def interest_expense_group_amount(group: list[tuple[BorrowingLine, int]]) -> tup
 def is_financial_expense_summary_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     return "금융수익" in compact and "금융비용" in compact and "이자비용" in compact and "합계" in compact
+
+
+def is_amortized_financial_liability_interest(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return "상각후원가" in compact and "금융부채" in compact and "이자비용" in compact
 
 
 def extract_interest_expense_amount(line: BorrowingLine) -> int | None:
@@ -1481,9 +1516,14 @@ def extract_actual_interest(text: str) -> float | None:
 
 
 def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLine], tests: list[dict]) -> None:
-    borrowing_filter_lines = [line for line in lines if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD]
+    financial_statement_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
+    borrowing_filter_lines = [
+        line
+        for line in lines
+        if line.keyword != NOTE_INTEREST_EXPENSE_KEYWORD and line.source_file != "fnlttSinglAcntAll.json"
+    ]
     interest_expense_lines = [line for line in lines if line.keyword == NOTE_INTEREST_EXPENSE_KEYWORD]
-    filter_headers = ["회사명", "보고서명", "접수일", "접수번호", "키워드", "주석구분", "이자율", "금액후보", "금액단위", "최대금액", "원문파일", "줄번호", "문맥"]
+    filter_headers = ["회사명", "보고서명", "접수일", "접수번호", "키워드", "주석구분", "이자율", "원문검출금액", "금액단위", "적용금액", "원문파일", "줄번호", "문맥"]
 
     def filter_row(line: BorrowingLine) -> list:
         return [
@@ -1513,6 +1553,12 @@ def save_workbook(path: Path, reports: list[DartReport], lines: list[BorrowingLi
             "차입금필터링",
             filter_headers,
             [filter_row(line) for line in borrowing_filter_lines],
+            {10: 2, 12: 2},
+        ),
+        (
+            "재무상태표차입잔액",
+            filter_headers,
+            [filter_row(line) for line in financial_statement_lines],
             {10: 2, 12: 2},
         ),
         (
