@@ -1994,19 +1994,19 @@ def finance_cost_interest_candidate_score(line: BorrowingLine, amount: int) -> t
     section_score = 2 if line.section == "금융비용 주석" else 0
     finance_cost_note_score = 1 if any(keyword in compact for keyword in ("금융비용", "금융원가", "금융비용의내역", "금융원가의내역")) else 0
     exact_interest_row_score = 1 if any(keyword in compact for keyword in ("이자비용(금융비용)", "이자비용(금융원가)", "구분당기전기이자비용")) else 0
-    standalone_note_score = 1 if "연결회사" not in compact and "연결회사는" not in compact else 0
-    source_detail_score = 1 if "_" in line.source_file else 0
     period_score = interest_context_period_score(line.context)
-    full_context_score = 1 if line.line_no == 1 else 0
+    direct_row_score = 1 if line.line_no != 1 else 0
+    connected_order_score = -line.line_no if line.line_no != 1 else -999_999
+    source_detail_score = 1 if "_" in line.source_file else 0
     return (
         section_score,
         finance_cost_note_score,
         exact_interest_row_score,
-        standalone_note_score,
-        source_detail_score,
         period_score,
-        full_context_score,
-        -amount,
+        direct_row_score,
+        connected_order_score,
+        source_detail_score,
+        amount,
     )
 
 
