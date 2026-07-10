@@ -14,7 +14,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -337,6 +337,7 @@ class DartClient:
     def extract_borrowing_lines(self, report: DartReport) -> list[BorrowingLine]:
         files = self.get_document_texts(report.receipt_no)
         rows: list[BorrowingLine] = []
+        benchmark_rate = sofr_rate_for_report(report)
         for source_file, text in files:
             for chunk_start, chunk_text in relevant_note_chunks(text):
                 base_line_no = text.count("\n", 0, chunk_start)
@@ -346,7 +347,7 @@ class DartClient:
                     keyword = display_keyword_for_context(context, section)
                     if not keyword:
                         continue
-                    rates = extract_rate_values(context)
+                    rates = extract_rate_values(context, benchmark_rate)
                     amounts = extract_amount_values(context)
                     if note_section_for_context(context) and not rates and not amounts:
                         continue
@@ -380,6 +381,7 @@ class DartClient:
                         )
                     )
                 rows.extend(extract_borrowing_table_rate_lines(report, source_file, chunk_text))
+                rows.extend(extract_flat_borrowing_rate_lines(report, source_file, chunk_text))
                 rows.extend(extract_interest_expense_lines_from_document(report, source_file, chunk_text))
         return rows
 
@@ -578,6 +580,54 @@ def report_period_key(report: DartReport) -> tuple[int, int] | None:
     year = report_business_year(report)
     if year.isdigit():
         return int(year), report_period_months(report)
+    return None
+
+
+def report_period_end_date(report: DartReport) -> date | None:
+    key = report_period_key(report)
+    if not key:
+        return None
+    year, month = key
+    try:
+        return date(year, month, calendar.monthrange(year, month)[1])
+    except ValueError:
+        return None
+
+
+SOFR_RATE_CACHE: dict[str, float | None] = {}
+
+
+def sofr_rate_for_report(report: DartReport) -> float | None:
+    end_date = report_period_end_date(report)
+    if end_date is None:
+        return None
+    return sofr_rate_on_or_before(end_date)
+
+
+def sofr_rate_on_or_before(target_date: date) -> float | None:
+    for offset in range(0, 10):
+        lookup_date = target_date - timedelta(days=offset)
+        key = lookup_date.isoformat()
+        if key in SOFR_RATE_CACHE:
+            rate = SOFR_RATE_CACHE[key]
+            if rate is not None:
+                return rate
+            continue
+        try:
+            url = (
+                "https://markets.newyorkfed.org/api/rates/secured/sofr/search.json"
+                f"?startDate={key}&endDate={key}&type=rate"
+            )
+            with urllib.request.urlopen(url, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+            entries = data.get("refRates") or []
+            if entries:
+                rate = float(entries[0]["percentRate"]) / 100
+                SOFR_RATE_CACHE[key] = rate
+                return rate
+            SOFR_RATE_CACHE[key] = None
+        except Exception:
+            SOFR_RATE_CACHE[key] = None
     return None
 
 
@@ -952,6 +1002,94 @@ def extract_borrowing_table_rate_lines(report: DartReport, source_file: str, tex
     return rows
 
 
+def extract_flat_borrowing_rate_lines(report: DartReport, source_file: str, text: str) -> list[BorrowingLine]:
+    plain = clean_context(text)
+    compact = re.sub(r"\s+", "", plain)
+    if "연이자율" not in compact or not any(keyword in compact for keyword in ("차입금", "사채", "회사채")):
+        return []
+
+    unit = detect_amount_unit(plain)
+    benchmark_rate = sofr_rate_for_report(report)
+    rows: list[BorrowingLine] = []
+    seen: set[str] = set()
+    rate_token = r"(?:(?:[A-Za-z가-힣]+(?:\([^)]+\))?)\s*\+\s*)?\d{1,2}(?:\.\d{1,5})?(?:\s*(?:~|-|∼|～)\s*\d{1,2}(?:\.\d{1,5})?)%?"
+    trailing_rate_token = r"(?P<rate>\d+(?:\.\d+)?(?:\s*(?:~|-|∼|～)\s*\d+(?:\.\d+)?)?%?)\s*$"
+    amount_token = r"\(?-?\d{1,3}(?:,\d{3})+\)?"
+    row_pattern = re.compile(amount_token)
+    for match in row_pattern.finditer(plain):
+        prefix = plain[max(0, match.start() - 140) : match.start()]
+        rate_match = re.search(trailing_rate_token, prefix, flags=re.IGNORECASE)
+        if not rate_match:
+            continue
+        absolute_rate_start = max(0, match.start() - 140) + rate_match.start("rate")
+        if is_unknown_benchmark_spread(plain, absolute_rate_start):
+            continue
+        context_start = max(0, rate_match.start() + max(0, match.start() - 140) - 260)
+        context_end = min(len(plain), match.end() + 180)
+        context = plain[context_start:context_end].strip()
+        label = prefix[: rate_match.start()]
+        if not is_flat_borrowing_rate_context(context, label):
+            continue
+        if is_sofr_equivalent_benchmark_spread(plain, absolute_rate_start):
+            rate_text = plain[max(0, absolute_rate_start - 40) : absolute_rate_start] + rate_match.group("rate")
+        else:
+            rate_text = rate_match.group("rate")
+        rates = extract_rate_values("연이자율 " + rate_text, benchmark_rate)
+        if not rates:
+            continue
+        amount = parse_signed_amount(match.group(0))
+        if amount is None or amount <= 0:
+            continue
+        normalized_amount = normalize_amount_to_million(amount, unit)
+        if normalized_amount <= 0:
+            continue
+        key = normalize_text(f"{label} {rate_match.group('rate')} {match.group(0)}")
+        if key in seen:
+            continue
+        seen.add(key)
+        source_pos = text.find(rate_match.group("rate"))
+        line_no = text.count("\n", 0, source_pos if source_pos >= 0 else 0) + 1
+        rows.append(
+            BorrowingLine(
+                report.corp_name,
+                report.report_name,
+                report.receipt_date,
+                report.receipt_no,
+                flat_borrowing_keyword(context),
+                "차입금/사채 주석",
+                rates,
+                [amount],
+                unit,
+                normalized_amount,
+                Path(source_file).name or f"{report.receipt_no}.xml",
+                line_no,
+                context[:1200],
+            )
+        )
+    return rows
+
+
+def is_flat_borrowing_rate_context(context: str, label: str) -> bool:
+    compact = re.sub(r"\s+", "", context)
+    label_compact = re.sub(r"\s+", "", label)
+    if any(keyword in compact for keyword in ("이자율변동위험", "파생상품", "계약가격", "위험관리")):
+        return False
+    if any(keyword in label_compact for keyword in ("합계", "소계", "차감계")):
+        return False
+    return any(keyword in compact for keyword in ("연이자율", "차입금", "사채", "회사채", "USANCE", "일반대출", "시설자금", "운영자금"))
+
+
+def flat_borrowing_keyword(context: str) -> str:
+    compact = re.sub(r"\s+", "", context)
+    if "사채" in compact or "회사채" in compact:
+        return "사채"
+    if "장기차입" in compact or "시설자금" in compact or "운영자금" in compact:
+        return "장기차입금"
+    if "단기차입" in compact or "USANCE" in context.upper() or "일반대출" in compact:
+        return "단기차입금"
+    return "차입금"
+
+
 def should_parse_borrowing_rate_table(raw_html: str) -> bool:
     compact = re.sub(r"\s+", "", raw_html)
     if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "InterestRate", "interestrate")):
@@ -983,10 +1121,11 @@ def borrowing_lines_from_table_rows(
 
     date_by_col = table_date_values(table_rows)
     total_cols = table_total_columns(table_rows)
+    benchmark_rate = sofr_rate_for_report(report)
     for rate_idx, rate_cells in rate_rows:
         if is_prior_period_table_segment(table_rows, rate_idx):
             continue
-        rates_by_col = table_rates_by_column(rate_cells)
+        rates_by_col = table_rates_by_column(rate_cells, benchmark_rate)
         if not rates_by_col:
             continue
         excluded_cols = total_cols | table_excluded_columns_near_rate(table_rows, rate_idx)
@@ -1138,7 +1277,10 @@ def has_borrowing_keyword(text: str) -> bool:
 def is_table_rate_row(cells: list[str]) -> bool:
     row_text = " ".join(cells)
     compact = re.sub(r"\s+", "", row_text)
-    return any(keyword in compact for keyword in ("이자율", "이율", "금리", "연이자율", "interestrate")) and bool(table_rates_by_column(cells))
+    has_rate_header = any(keyword in compact for keyword in ("이자율", "이율", "금리", "연이자율", "interestrate"))
+    if not has_rate_header:
+        return False
+    return bool(table_rates_by_column(cells)) or bool(re.search(r"(?:libor|sofr)[^0-9]{0,20}\+\s*\d", row_text, flags=re.IGNORECASE))
 
 
 def is_table_borrowing_amount_row(cells: list[str]) -> bool:
@@ -1166,10 +1308,10 @@ def borrowing_table_keyword(label: str) -> str:
     return "차입금"
 
 
-def table_rates_by_column(cells: list[str]) -> dict[int, list[float]]:
+def table_rates_by_column(cells: list[str], benchmark_rate: float | None = None) -> dict[int, list[float]]:
     rates_by_col: dict[int, list[float]] = {}
     for idx, cell in enumerate(cells):
-        rates = extract_rate_values("이자율 " + cell)
+        rates = extract_rate_values("이자율 " + cell, benchmark_rate)
         if not rates and re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
             rates = [0.0]
         rates = [rate for rate in rates if 0 <= rate <= 0.50]
@@ -2607,9 +2749,19 @@ def extract_rate(text: str) -> float | None:
     return sum(rates) / len(rates) if rates else None
 
 
-def extract_rate_values(text: str) -> list[float]:
+def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[float]:
     rates: list[float] = []
-    for raw in re.findall(r"(?<![\d.])(\d{1,2}(?:\.\d{1,4})?)\s*%(?!\d)", text):
+    for match in re.finditer(r"(?<![\d.])(\d{1,2}(?:\.\d{1,4})?)\s*%(?!\d)", text):
+        raw = match.group(1)
+        if is_unknown_benchmark_spread(text, match.start()):
+            continue
+        if is_sofr_equivalent_benchmark_spread(text, match.start()) and benchmark_rate is None:
+            continue
+        variable_rate = variable_benchmark_rate(text, match.start(), raw, benchmark_rate)
+        if variable_rate is not None:
+            if variable_rate not in rates:
+                rates.append(variable_rate)
+            continue
         try:
             rates.append(float(raw) / 100)
         except ValueError:
@@ -2623,6 +2775,23 @@ def extract_rate_values(text: str) -> list[float]:
             if value not in rates:
                 rates.append(value)
     if is_decimal_rate_context(text):
+        for match in re.finditer(r"(?<![\d,])(\d{1,2}\.\d{1,5})(?![\d,])", text):
+            raw = match.group(1)
+            if is_unknown_benchmark_spread(text, match.start()):
+                continue
+            if is_sofr_equivalent_benchmark_spread(text, match.start()) and benchmark_rate is None:
+                continue
+            variable_rate = variable_benchmark_rate(text, match.start(), raw, benchmark_rate)
+            if variable_rate is not None:
+                if variable_rate not in rates:
+                    rates.append(variable_rate)
+                continue
+            try:
+                value = float(raw) / 100
+            except ValueError:
+                continue
+            if is_reasonable_interest_rate(value) and value not in rates:
+                rates.append(value)
         for raw in re.findall(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
             try:
                 value = float(raw)
@@ -2631,6 +2800,28 @@ def extract_rate_values(text: str) -> list[float]:
             if is_reasonable_interest_rate(value) and value not in rates:
                 rates.append(value)
     return rates
+
+
+def variable_benchmark_rate(text: str, rate_start: int, spread_raw: str, benchmark_rate: float | None) -> float | None:
+    if not is_sofr_equivalent_benchmark_spread(text, rate_start) or benchmark_rate is None:
+        return None
+    try:
+        spread = float(spread_raw) / 100
+    except ValueError:
+        return None
+    return benchmark_rate + spread
+
+
+def is_sofr_equivalent_benchmark_spread(text: str, rate_start: int) -> bool:
+    prefix = re.sub(r"\s+", "", text[max(0, rate_start - 40) : rate_start]).lower()
+    if not prefix.endswith("+"):
+        return False
+    return any(keyword in prefix for keyword in ("libor", "sofr"))
+
+
+def is_unknown_benchmark_spread(text: str, rate_start: int) -> bool:
+    prefix = re.sub(r"\s+", "", text[max(0, rate_start - 40) : rate_start]).lower()
+    return prefix.endswith("+") and not any(keyword in prefix for keyword in ("libor", "sofr"))
 
 
 def is_decimal_rate_context(text: str) -> bool:
