@@ -311,7 +311,7 @@ class DartClient:
             account_id = normalize_text(row.get("account_id", ""))
             if not is_revenue_account(account, account_id):
                 continue
-            amount = parse_dart_amount(row.get("thstrm_amount", ""))
+            amount = revenue_amount_for_report(row, report)
             if amount is not None and amount > 0:
                 revenues.append(amount // 1_000_000)
         return max(revenues) if revenues else None
@@ -704,6 +704,19 @@ def parse_dart_amount(value: str) -> int | None:
         return abs(int(cleaned))
     except ValueError:
         return None
+
+
+def revenue_amount_for_report(row: dict, report: DartReport) -> int | None:
+    report_name = re.sub(r"\s+", "", report.report_name)
+    if "반기보고서" in report_name:
+        preferred_fields = ("thstrm_add_amount", "thstrm_amount")
+    else:
+        preferred_fields = ("thstrm_amount", "thstrm_add_amount")
+    for field in preferred_fields:
+        amount = parse_dart_amount(row.get(field, ""))
+        if amount is not None and amount > 0:
+            return amount
+    return None
 
 
 def is_financial_borrowing_account(account: str) -> bool:
