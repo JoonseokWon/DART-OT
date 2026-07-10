@@ -1973,6 +1973,10 @@ def note_interest_disclosure_comparison(lines: list[BorrowingLine]) -> tuple[int
     return None
 
 
+def has_standalone_interest_expense_label(text: str) -> bool:
+    return bool(re.search(r"(?:^|\s)이자비용(?:\s|\(|[0-9])", text))
+
+
 def is_explanatory_interest_expense_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     return "이자비용" in compact and any(
@@ -2249,6 +2253,8 @@ def is_borrowing_interest_expense_context(text: str) -> bool:
         return False
     if "이자비용" not in compact:
         return False
+    if has_standalone_interest_expense_label(text) and any(keyword in compact for keyword in ("금융비용", "금융원가", "금융수익및금융비용", "금융수익과금융비용")):
+        return True
     if any(keyword in compact for keyword in ("리스부채", "확정급여", "순확정", "충당부채", "복구충당", "계약부채")):
         return False
     exact_phrases = (
