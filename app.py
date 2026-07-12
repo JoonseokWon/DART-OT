@@ -1791,6 +1791,22 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
         seen_contexts.add(key)
         candidates.append((line, amount))
 
+    rate_amount_candidates: list[tuple[BorrowingLine, int]] = []
+    seen_rate_amount_keys: set[tuple[str, int]] = set()
+    for line in note_lines:
+        if not line.interest_rates:
+            continue
+        if not is_valid_borrowing_rate_line(line):
+            continue
+        amount = extract_current_amount(line)
+        if amount is None or amount <= 0:
+            continue
+        key = (borrowing_line_label(line.context), amount)
+        if key in seen_rate_amount_keys:
+            continue
+        seen_rate_amount_keys.add(key)
+        rate_amount_candidates.append((line, amount))
+
     statement_candidates = [(line, amount) for line, amount in candidates if is_statement_borrowing_row(line)]
     if statement_candidates:
         by_category: dict[str, tuple[BorrowingLine, int]] = {}
@@ -1806,6 +1822,10 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
     total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
     if total_candidates:
         selected_line, selected_amount = max(total_candidates, key=lambda item: item[1])
+        if selected_amount == 0 and rate_amount_candidates:
+            amount_sum = sum(amount for _, amount in rate_amount_candidates)
+            max_amount = max((amount for _, amount in rate_amount_candidates), default=0)
+            return amount_sum, max_amount, "차입금/사채 합계 0으로 공시되어 이자율이 있는 사채 항목 금액 사용", [line for line, _ in rate_amount_candidates]
         return selected_amount, selected_amount, "차입금/사채 주석 합계/총계 행 사용", [selected_line]
 
     selected: list[tuple[BorrowingLine, int]] = []
