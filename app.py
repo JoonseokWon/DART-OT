@@ -1093,9 +1093,34 @@ def flat_borrowing_keyword(context: str) -> str:
 
 def should_parse_borrowing_rate_table(raw_html: str) -> bool:
     compact = re.sub(r"\s+", "", raw_html)
+    if is_interest_rate_sensitivity_context(compact):
+        return False
     if not any(keyword in compact for keyword in ("이자율", "이율", "금리", "InterestRate", "interestrate")):
         return False
-    return any(keyword in compact for keyword in ("차입금", "사채", "회사채", "Borrowing", "Borrowings", "Debt", "Bond"))
+    return is_structured_borrowing_rate_table_context(compact)
+
+
+def is_structured_borrowing_rate_table_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    if not any(keyword in compact for keyword in ("차입금", "사채", "회사채", "borrowing", "borrowings", "debt", "bond")):
+        return False
+    return any(
+        keyword in compact
+        for keyword in (
+            "연이자율",
+            "차입처",
+            "차입금명칭",
+            "차입금종류",
+            "거래상대방",
+            "만기",
+            "상환일",
+            "발행일",
+            "usance",
+            "일반대출",
+            "시설자금",
+            "운영자금",
+        )
+    )
 
 
 def borrowing_lines_from_table_rows(
@@ -1112,6 +1137,8 @@ def borrowing_lines_from_table_rows(
     rows: list[BorrowingLine] = []
     if not table_rows:
         return rows
+    if is_interest_rate_sensitivity_context(table_text):
+        return rows
     if not is_borrowing_note_section(section) and not is_borrowing_table_text(table_text):
         return rows
 
@@ -1126,7 +1153,16 @@ def borrowing_lines_from_table_rows(
     for rate_idx, rate_cells in rate_rows:
         if is_prior_period_table_segment(table_rows, rate_idx):
             continue
-        rates_by_col = table_rates_by_column(rate_cells, benchmark_rate)
+        rates_by_col = table_rates_by_column(rate_cells, benchmark_rate, is_percent_rate_unit_context(table_text))
+        if is_benchmark_spread_table_row(rate_cells):
+            benchmark_by_col: dict[int, float] = {}
+            for nearby_idx in range(max(0, rate_idx - 3), rate_idx):
+                benchmark_by_col.update(table_benchmark_rates_by_column(table_rows[nearby_idx], benchmark_rate))
+            rates_by_col = {
+                col: [benchmark_by_col[col] + rate for rate in rates]
+                for col, rates in rates_by_col.items()
+                if col in benchmark_by_col
+            }
         if not rates_by_col:
             continue
         excluded_cols = total_cols | table_excluded_columns_near_rate(table_rows, rate_idx)
@@ -1222,7 +1258,9 @@ def parse_rate_tr_windows(text: str) -> list[tuple[int, str]]:
     seen_starts: set[int] = set()
     for idx, match in enumerate(matches):
         row = match.group(0)
-        if not any(keyword in row for keyword in ("이자율", "이율", "금리", "InterestRate", "interestrate")):
+        if "연이자율" not in row and not any(keyword in row for keyword in ("InterestRate", "interestrate")):
+            continue
+        if is_interest_rate_sensitivity_context(row):
             continue
         start_idx = max(0, idx - 8)
         end_idx = min(len(matches), idx + 9)
@@ -1251,7 +1289,28 @@ def borrowing_section_for_table(text: str, table_start: int, table_text: str) ->
 
 def is_borrowing_table_text(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
-    return any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "사채", "회사채", "borrow", "debt", "bond"))
+    if is_interest_rate_sensitivity_context(compact):
+        return False
+    return is_structured_borrowing_rate_table_context(compact)
+
+
+def is_interest_rate_sensitivity_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    return any(
+        keyword in compact
+        for keyword in (
+            "이자율위험",
+            "이자율변동위험",
+            "민감도",
+            "basispoints",
+            "100bp",
+            "100basis",
+            "시장위험",
+            "위험관리",
+            "세전손익에미치는영향",
+            "이자비용이당기세전손익에미치는영향",
+        )
+    )
 
 
 def has_borrowing_keyword(text: str) -> bool:
@@ -1309,9 +1368,15 @@ def borrowing_table_keyword(label: str) -> str:
     return "차입금"
 
 
-def table_rates_by_column(cells: list[str], benchmark_rate: float | None = None) -> dict[int, list[float]]:
+def table_rates_by_column(
+    cells: list[str],
+    benchmark_rate: float | None = None,
+    percent_unit_context: bool | None = None,
+) -> dict[int, list[float]]:
     rates_by_col: dict[int, list[float]] = {}
-    rate_prefix = "이자율(%) " if is_percent_rate_unit_context(" ".join(cells)) else "이자율 "
+    if percent_unit_context is None:
+        percent_unit_context = is_percent_rate_unit_context(" ".join(cells))
+    rate_prefix = "이자율(%) " if percent_unit_context else "이자율 "
     for idx, cell in enumerate(cells):
         rates = extract_rate_values(rate_prefix + cell, benchmark_rate)
         if not rates and re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
@@ -1319,6 +1384,22 @@ def table_rates_by_column(cells: list[str], benchmark_rate: float | None = None)
         rates = [rate for rate in rates if rate == 0 or is_reasonable_interest_rate(rate)]
         if rates or re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
             rates_by_col[idx] = rates
+    return rates_by_col
+
+
+def is_benchmark_spread_table_row(cells: list[str]) -> bool:
+    compact = re.sub(r"\s+", "", " ".join(cells)).lower()
+    return any(keyword in compact for keyword in ("기준이자율조정", "가산금리", "spread", "margin"))
+
+
+def table_benchmark_rates_by_column(cells: list[str], benchmark_rate: float | None) -> dict[int, float]:
+    if benchmark_rate is None:
+        return {}
+    rates_by_col: dict[int, float] = {}
+    for idx, cell in enumerate(cells):
+        compact = re.sub(r"\s+", "", cell).lower()
+        if any(keyword in compact for keyword in ("sofr", "libor")):
+            rates_by_col[idx] = benchmark_rate
     return rates_by_col
 
 
@@ -1819,6 +1900,21 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
         selected = list(by_category.values())
         amount_sum = sum(amount for _, amount in selected)
         max_amount = max((amount for _, amount in selected), default=0)
+        financial_amount, financial_line = financial_statement_borrowing_amount(financial_api_lines)
+        if financial_amount > 0 and amount_sum > financial_amount * 1.5:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 항목합산액 {amount_sum:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과대하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
+        if financial_amount > 0 and amount_sum < financial_amount * 0.75:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 항목합산액 {amount_sum:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과소하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
         return amount_sum, max_amount, "차입금/사채 주석 항목 우선", [line for line, _ in selected]
 
     total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
@@ -2808,7 +2904,7 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
     for left, right in re.findall(r"(?<![\d,])(\d{1,2}\.\d{1,4})\s*(?:~|-|∼|～)\s*(\d{1,2}\.\d{1,4})(?![\d,])", text):
         for raw in (left, right):
             try:
-                value = float(raw) / 100
+                value = rate_value_from_decimal_text(raw, percent_unit_context)
             except ValueError:
                 continue
             if is_reasonable_interest_rate(value) and value not in rates:
@@ -2826,7 +2922,7 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
                     rates.append(variable_rate)
                 continue
             try:
-                value = float(raw) / 100
+                value = rate_value_from_decimal_text(raw, percent_unit_context)
             except ValueError:
                 continue
             if is_reasonable_interest_rate(value) and value not in rates:
@@ -2840,6 +2936,14 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
                 if is_reasonable_interest_rate(value) and value not in rates:
                     rates.append(value)
     return rates
+
+
+def rate_value_from_decimal_text(raw: str, percent_unit_context: bool) -> float:
+    value = float(raw)
+    decimals = raw.split(".", 1)[1] if "." in raw else ""
+    if percent_unit_context and 0.01 <= value < 1 and len(decimals) >= 4:
+        return value / 10
+    return value / 100
 
 
 def is_percent_rate_unit_context(text: str) -> bool:
