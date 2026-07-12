@@ -2669,6 +2669,8 @@ def is_borrowing_note_section(section: str) -> bool:
 
 def is_valid_borrowing_rate_context(text: str, allow_mixed_lease: bool = False) -> bool:
     compact = re.sub(r"\s+", "", text).lower()
+    if is_conversion_movement_context(text):
+        return False
     if is_non_interest_percent_context(text):
         return False
     if not any(keyword in compact for keyword in ("차입금", "사채", "차입", "borrow", "debt", "bond")):
@@ -2693,12 +2695,35 @@ def is_valid_borrowing_rate_context(text: str, allow_mixed_lease: bool = False) 
         "조건부금융부채",
         "가중평균자본비용",
         "wacc",
+        "차입금의존도",
+        "세효과",
+        "평가손익",
+        "파생상품",
+        "내재파생",
+        "평가가정",
+        "공정가치평가",
+        "변동성",
+        "주가변동",
+        "기초자산",
+        "무위험",
+        "옵션가치",
+        "기대만기",
     )
     if any(keyword in compact for keyword in excluded):
         return False
     if "리스부채" in compact and not allow_mixed_lease:
         return False
     return True
+
+
+def is_conversion_movement_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if "전환사채전환" not in compact and "전환사채일부전환" not in compact and "전환권행사" not in compact:
+        return False
+    return bool(
+        re.search(r"\d{1,2}\.\d{1,2}(?:\.\d{1,2})?\s*~\s*\d{1,2}\.\d{1,2}(?:\.\d{1,2})?", text)
+        or re.search(r"\d{1,3}(?:,\d{3})+\s*\d{1,3}\s*\d{1,3}(?:,\d{3})+", text)
+    )
 
 
 def is_non_interest_percent_context(text: str) -> bool:
@@ -2723,6 +2748,19 @@ def is_non_interest_percent_context(text: str) -> bool:
         "지분율",
         "보통주",
         "우선주",
+        "차입금의존도",
+        "세효과",
+        "평가손익",
+        "파생상품",
+        "내재파생",
+        "평가가정",
+        "공정가치평가",
+        "변동성",
+        "주가변동",
+        "기초자산",
+        "무위험",
+        "옵션가치",
+        "기대만기",
     )
     return "%" in text and any(keyword in compact for keyword in non_interest_keywords)
 
@@ -2916,6 +2954,8 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
     if is_decimal_rate_context(text):
         for match in re.finditer(r"(?<![\d,])(\d{1,2}\.\d{1,5})(?![\d,])", text):
             raw = match.group(1)
+            if is_date_like_decimal_token(text, match.start(), match.end()):
+                continue
             if is_unknown_benchmark_spread(text, match.start()):
                 continue
             if is_sofr_equivalent_benchmark_spread(text, match.start()) and benchmark_rate is None:
@@ -2932,7 +2972,10 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
             if is_reasonable_interest_rate(value) and value not in rates:
                 rates.append(value)
         if not percent_unit_context:
-            for raw in re.findall(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
+            for match in re.finditer(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
+                raw = match.group(0)
+                if is_date_like_decimal_token(text, match.start(), match.end()):
+                    continue
                 try:
                     value = float(raw)
                 except ValueError:
@@ -2940,6 +2983,22 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
                 if is_reasonable_interest_rate(value) and value not in rates:
                     rates.append(value)
     return rates
+
+
+def is_date_like_decimal_token(text: str, start: int, end: int) -> bool:
+    if (start > 0 and text[start - 1] == ".") or (end < len(text) and text[end : end + 1] == "."):
+        return True
+    window = text[max(0, start - 8) : min(len(text), end + 8)]
+    if re.search(r"\d{2,4}\.\d{1,2}\.\d{1,2}", window):
+        return True
+    if re.search(r"\d{1,2}\.\d{1,2}\.\d{2,4}", window):
+        return True
+    compact_window = re.sub(r"\s+", "", text[max(0, start - 40) : min(len(text), end + 40)])
+    if re.search(r"\d{1,2}\.\d{1,2}(?:\.\d{1,2})?~\d{1,2}\.\d{1,2}(?:\.\d{1,2})?", compact_window):
+        return True
+    if any(keyword in compact_window for keyword in ("발행일", "상환일", "만기일", "취득일", "처분일", "보고일", "기준일", "일자")):
+        return True
+    return False
 
 
 def rate_value_from_decimal_text(raw: str, percent_unit_context: bool) -> float:
