@@ -830,8 +830,8 @@ def display_keyword_for_context(text: str, section: str = "") -> str:
     compact = re.sub(r"\s+", "", text)
     if any(keyword in compact for keyword in ("사채처분손실", "사채처분이익")):
         return ""
-    if section in ("금융비용 주석", "금융수익 및 금융비용 주석"):
-        return NOTE_INTEREST_EXPENSE_KEYWORD if is_borrowing_interest_expense_context(text) else ""
+    if section in ("금융비용 주석", "금융수익 및 금융비용 주석", "재무수익 및 재무비용 주석") and is_borrowing_interest_expense_context(text):
+        return NOTE_INTEREST_EXPENSE_KEYWORD
     if section == "차입금/사채 주석" and is_borrowing_interest_expense_context(text):
         return ""
 
@@ -1516,6 +1516,10 @@ def note_section_for_context(text: str) -> str:
             "금융수익과금융비용",
             "금융수익및금융원가",
             "금융수익과금융원가",
+            "재무수익및재무비용",
+            "재무수익과재무비용",
+            "재무수익및재무원가",
+            "재무수익과재무원가",
         )
     ):
         return "금융비용 주석"
@@ -2527,7 +2531,7 @@ def is_borrowing_interest_expense_context(text: str) -> bool:
         return False
     if "이자비용" not in compact:
         return False
-    if has_standalone_interest_expense_label(text) and any(keyword in compact for keyword in ("금융비용", "금융원가", "금융수익및금융비용", "금융수익과금융비용")):
+    if has_standalone_interest_expense_label(text) and any(keyword in compact for keyword in ("금융비용", "금융원가", "금융수익및금융비용", "금융수익과금융비용", "재무비용", "재무원가", "재무수익및재무비용", "재무수익과재무비용")):
         return True
     if any(keyword in compact for keyword in ("리스부채", "확정급여", "순확정", "충당부채", "복구충당", "계약부채")):
         return False
@@ -2542,7 +2546,7 @@ def is_borrowing_interest_expense_context(text: str) -> bool:
     )
     if any(phrase in compact for phrase in exact_phrases):
         return True
-    return any(keyword in compact for keyword in ("차입금", "사채", "금융부채", "금융원가", "금융비용"))
+    return any(keyword in compact for keyword in ("차입금", "사채", "금융부채", "금융원가", "금융비용", "재무원가", "재무비용"))
 
 
 def is_borrowing_amount_context(text: str) -> bool:
@@ -2553,7 +2557,7 @@ def is_borrowing_amount_context(text: str) -> bool:
         return False
     if is_current_period_zero_amount(text):
         return True
-    if not any(keyword in compact for keyword in ("장부금액", "액면금액", "권면총액", "미상환잔액", "유동성", "비유동성", "차입금명칭")):
+    if not any(keyword in compact for keyword in ("장부금액", "액면금액", "권면총액", "미상환잔액", "유동성", "비유동성", "차입금명칭", "차입금(사채포함)")):
         return False
     exclusion_keywords = (
         "이자비용",
