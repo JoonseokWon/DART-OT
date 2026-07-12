@@ -1034,7 +1034,8 @@ def extract_flat_borrowing_rate_lines(report: DartReport, source_file: str, text
             rate_text = plain[max(0, absolute_rate_start - 40) : absolute_rate_start] + rate_match.group("rate")
         else:
             rate_text = rate_match.group("rate")
-        rates = extract_rate_values("연이자율 " + rate_text, benchmark_rate)
+        rate_prefix = "연이자율(%) " if is_percent_rate_unit_context(plain) else "연이자율 "
+        rates = extract_rate_values(rate_prefix + rate_text, benchmark_rate)
         if not rates:
             continue
         amount = parse_signed_amount(match.group(0))
@@ -1310,11 +1311,12 @@ def borrowing_table_keyword(label: str) -> str:
 
 def table_rates_by_column(cells: list[str], benchmark_rate: float | None = None) -> dict[int, list[float]]:
     rates_by_col: dict[int, list[float]] = {}
+    rate_prefix = "이자율(%) " if is_percent_rate_unit_context(" ".join(cells)) else "이자율 "
     for idx, cell in enumerate(cells):
-        rates = extract_rate_values("이자율 " + cell, benchmark_rate)
+        rates = extract_rate_values(rate_prefix + cell, benchmark_rate)
         if not rates and re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
             rates = [0.0]
-        rates = [rate for rate in rates if 0 <= rate <= 0.50]
+        rates = [rate for rate in rates if rate == 0 or is_reasonable_interest_rate(rate)]
         if rates or re.fullmatch(r"\s*0(?:\.0{1,5})?\s*", cell):
             rates_by_col[idx] = rates
     return rates_by_col
@@ -1892,7 +1894,13 @@ def extract_current_amount(line: BorrowingLine) -> int | None:
 def borrowing_amount_unit_for_context(value: int, unit: str, context: str) -> str:
     compact_unit = re.sub(r"\s+", "", unit or "")
     compact_context = re.sub(r"\s+", "", context or "")
-    if compact_unit in ("억원", "원") and compact_unit not in compact_context and value >= 100_000:
+    if compact_unit == "":
+        if value >= 10_000_000_000:
+            return "원"
+        return compact_unit
+    if compact_unit == "원":
+        return compact_unit
+    if compact_unit == "억원" and compact_unit not in compact_context and value >= 100_000:
         return "백만원"
     return compact_unit
 
@@ -1903,6 +1911,10 @@ def is_current_period_zero_amount(text: str) -> bool:
 
 def normalize_amount_to_million(value: int, unit: str) -> int:
     compact = re.sub(r"\s+", "", unit or "")
+    if compact == "":
+        if value >= 10_000_000_000:
+            return round(value / 1_000_000)
+        return value
     if "십억원" in compact:
         return value * 1_000
     if "천원" in compact:
@@ -1917,7 +1929,11 @@ def normalize_amount_to_million(value: int, unit: str) -> int:
 def normalize_interest_amount_to_million(value: int, unit: str) -> int:
     compact = re.sub(r"\s+", "", unit or "")
     if compact == "":
+        if value >= 10_000_000_000:
+            return round(value / 1_000_000)
         return value
+    if compact == "백만원" and value >= 10_000_000:
+        return round(value / 1_000)
     if compact == "원":
         if value >= 10_000_000:
             return round(value / 1_000_000)
@@ -2612,7 +2628,7 @@ def is_non_interest_percent_context(text: str) -> bool:
 
 
 def is_reasonable_interest_rate(rate: float) -> bool:
-    return 0 < rate <= 0.50
+    return 0 < rate <= 0.25
 
 
 def estimation_interest_rates(line: BorrowingLine) -> list[float]:
@@ -2771,6 +2787,7 @@ def extract_rate(text: str) -> float | None:
 
 def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[float]:
     rates: list[float] = []
+    percent_unit_context = is_percent_rate_unit_context(text)
     for match in re.finditer(r"(?<![\d.])(\d{1,2}(?:\.\d{1,4})?)\s*%(?!\d)", text):
         raw = match.group(1)
         if is_unknown_benchmark_spread(text, match.start()):
@@ -2783,16 +2800,18 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
                 rates.append(variable_rate)
             continue
         try:
-            rates.append(float(raw) / 100)
+            value = float(raw) / 100
         except ValueError:
             continue
+        if is_reasonable_interest_rate(value):
+            rates.append(value)
     for left, right in re.findall(r"(?<![\d,])(\d{1,2}\.\d{1,4})\s*(?:~|-|∼|～)\s*(\d{1,2}\.\d{1,4})(?![\d,])", text):
         for raw in (left, right):
             try:
                 value = float(raw) / 100
             except ValueError:
                 continue
-            if value not in rates:
+            if is_reasonable_interest_rate(value) and value not in rates:
                 rates.append(value)
     if is_decimal_rate_context(text):
         for match in re.finditer(r"(?<![\d,])(\d{1,2}\.\d{1,5})(?![\d,])", text):
@@ -2812,14 +2831,20 @@ def extract_rate_values(text: str, benchmark_rate: float | None = None) -> list[
                 continue
             if is_reasonable_interest_rate(value) and value not in rates:
                 rates.append(value)
-        for raw in re.findall(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
-            try:
-                value = float(raw)
-            except ValueError:
-                continue
-            if is_reasonable_interest_rate(value) and value not in rates:
-                rates.append(value)
+        if not percent_unit_context:
+            for raw in re.findall(r"(?<![\d,])0\.\d{2,5}(?![\d,])", text):
+                try:
+                    value = float(raw)
+                except ValueError:
+                    continue
+                if is_reasonable_interest_rate(value) and value not in rates:
+                    rates.append(value)
     return rates
+
+
+def is_percent_rate_unit_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return bool(re.search(r"(?:이자율|이율|금리|rate)\s*\(\s*%\s*\)", compact, re.IGNORECASE))
 
 
 def variable_benchmark_rate(text: str, rate_start: int, spread_raw: str, benchmark_rate: float | None) -> float | None:
