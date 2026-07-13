@@ -108,6 +108,14 @@ class FinancialExpense:
 
 
 @dataclass
+class RateInterestEstimate:
+    average_rate: float
+    covered_amount: float
+    expected_interest: float
+    line_count: int
+
+
+@dataclass
 class ExtractionIssue:
     corp_name: str
     report_name: str
@@ -723,6 +731,48 @@ def borrowing_movement_amounts(lines: list[BorrowingLine]) -> list[int]:
     return amounts
 
 
+def conversion_adjustment_amortization(lines: list[BorrowingLine]) -> int:
+    clusters: list[list[tuple[int, BorrowingLine]]] = []
+    for line in sorted(lines, key=lambda item: (item.source_file, item.line_no)):
+        amount = conversion_adjustment_amortization_amount(line)
+        if amount <= 0:
+            continue
+        if not clusters:
+            clusters.append([(amount, line)])
+            continue
+        prev_line = clusters[-1][-1][1]
+        if line.source_file == prev_line.source_file and 0 <= line.line_no - prev_line.line_no <= 250:
+            clusters[-1].append((amount, line))
+        else:
+            clusters.append([(amount, line)])
+    if not clusters:
+        return 0
+    return max(amount for amount, _ in clusters[0])
+
+
+def conversion_adjustment_amortization_amount(line: BorrowingLine) -> int:
+    compact = re.sub(r"\s+", "", line.context)
+    if "전환사채" not in compact:
+        return 0
+    if any(keyword in compact for keyword in ("전환사채전환", "전환사채일부전환", "평가손익", "세효과", "전환가액", "전환가격")):
+        return 0
+    values = [conversion_adjustment_table_amount_to_million(abs(value), line.amount_unit) for value in line.amounts if abs(value) > 0]
+    if len(values) != 3:
+        return 0
+    beginning, adjustment, ending = values
+    if adjustment >= max(beginning, ending) * 0.25:
+        return 0
+    if abs((beginning + adjustment) - ending) > max(2, ending * 0.02):
+        return 0
+    return adjustment
+
+
+def conversion_adjustment_table_amount_to_million(value: int, unit: str) -> int:
+    if value >= 100_000:
+        return round(value / 1_000)
+    return normalize_amount_to_million(value, unit)
+
+
 def is_borrowing_movement_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if any(keyword in compact for keyword in ("할인발행차금", "담보", "주주총회", "동등배당", "정관")):
@@ -1141,6 +1191,57 @@ def borrowing_lines_from_table_rows(
         return rows
     if not is_borrowing_note_section(section) and not is_borrowing_table_text(table_text):
         return rows
+
+    percent_unit_context = is_percent_rate_unit_context(table_text)
+    for row_idx, cells in enumerate(table_rows):
+        label = first_text_cell(cells)
+        if not label:
+            continue
+        label_compact = re.sub(r"\s+", "", label)
+        if any(keyword in label_compact for keyword in ("구분", "이자율", "합계", "소계", "차감후")):
+            continue
+        rates_by_col = table_rates_by_column(cells, sofr_rate_for_report(report), percent_unit_context)
+        if not rates_by_col:
+            continue
+        amounts_by_col = table_amounts_by_column(cells, unit)
+        if not amounts_by_col:
+            continue
+        for rate_col, rates in rates_by_col.items():
+            if not rates:
+                continue
+            right_amount_cols = [col for col in amounts_by_col if col > rate_col]
+            amount_col = min(right_amount_cols, default=min(amounts_by_col, key=lambda col: abs(col - rate_col)))
+            amount = amounts_by_col[amount_col]
+            context = " ".join(
+                [
+                    section or "차입금/사채 주석",
+                    label,
+                    f"금액 {amount:,}백만원",
+                    "이자율 " + ", ".join(f"{rate:.4%}" for rate in rates),
+                ]
+            )
+            key = f"{report.receipt_no}:{source_file}:{table_start}:row:{row_idx}:{rate_col}:{amount_col}:{amount}:{rates}"
+            if key in seen:
+                continue
+            seen.add(key)
+            line_no = text.count("\n", 0, table_start) + 1
+            rows.append(
+                BorrowingLine(
+                    report.corp_name,
+                    report.report_name,
+                    report.receipt_date,
+                    report.receipt_no,
+                    display_keyword_for_context(label, section) or borrowing_table_keyword(label),
+                    section or "차입금/사채 주석",
+                    rates,
+                    [amount],
+                    "백만원",
+                    amount,
+                    Path(source_file).name or f"{report.receipt_no}.xml",
+                    line_no,
+                    context[:1200],
+                )
+            )
 
     rate_rows = [(idx, cells) for idx, cells in enumerate(table_rows) if is_table_rate_row(cells)]
     amount_rows = [(idx, cells) for idx, cells in enumerate(table_rows) if is_table_borrowing_amount_row(cells)]
@@ -1680,7 +1781,8 @@ def build_overall_tests(
         amount_sum, max_amount, amount_method, amount_used_lines = amount_cache.get(report.receipt_no, (0, 0, "차입금 잔액 후보 없음", []))
         period_months = report_period_months(report)
         period_key = report_period_key(report)
-        weighted_rate = weighted_average_interest_rate(target_rate_lines, amount_sum, period_key, period_months)
+        rate_interest_estimate = rate_line_interest_estimate(target_rate_lines, amount_sum, period_key, period_months)
+        weighted_rate = rate_interest_estimate.average_rate if rate_interest_estimate else weighted_average_interest_rate(target_rate_lines, amount_sum, period_key, period_months)
         has_amount_candidate = bool(amount_used_lines)
         yoy_report = latest_report_by_period.get((period_key[0] - 1, period_key[1])) if period_key else None
         yoy_amount_sum = amount_cache.get(yoy_report.receipt_no, (None, 0, "", []))[0] if yoy_report else None
@@ -1716,7 +1818,15 @@ def build_overall_tests(
         actual_interest_expense = financial_expense.actual_interest_expense
         actual_interest_comparable = actual_interest_expense is not None and is_exact_interest_expense_account(financial_expense.account_name)
         disclosure_comparison = note_interest_disclosure_comparison(report_lines)
-        expected_interest_expense = average_borrowing_balance * avg_rate * period_factor if avg_rate is not None and average_borrowing_balance else None
+        base_expected_interest = None
+        if rate_interest_estimate is not None:
+            base_expected_interest = rate_interest_estimate.expected_interest
+        elif avg_rate is not None and average_borrowing_balance:
+            base_expected_interest = average_borrowing_balance * avg_rate * period_factor
+        conversion_amortization = conversion_adjustment_amortization(test_lines)
+        expected_interest_expense = base_expected_interest
+        if expected_interest_expense is not None and conversion_amortization:
+            expected_interest_expense += conversion_amortization
         interest_expense_diff = absolute_amount_diff(actual_interest_expense, expected_interest_expense) if actual_interest_comparable and expected_interest_expense is not None else None
         interest_expense_error_rate = interest_expense_diff / expected_interest_expense if interest_expense_diff is not None and expected_interest_expense not in (None, 0) else None
         amount_units = sorted({line.amount_unit for line in amount_used_lines if line.max_amount and line.amount_unit})
@@ -1804,6 +1914,17 @@ def build_overall_tests(
                 "계산이자와 실제이자 차이 PM/3 초과함.",
             )
 
+        calc_notes: list[str] = []
+        if rate_interest_estimate is not None and expected_interest_expense is not None:
+            calc_notes.append(
+                f"금리 있는 차입금/사채 {rate_interest_estimate.covered_amount:,.0f}백만원 "
+                f"{rate_interest_estimate.line_count}개 행을 금액·기간 가중으로 직접 계산"
+            )
+        if conversion_amortization:
+            calc_notes.append(f"전환권조정 상각 {conversion_amortization:,.0f}백만원 가산")
+        if calc_notes and expected_interest_expense is not None and judgment in ("적정", "확인필요"):
+            judgment_basis = f"{judgment_basis} 산정 보정: {'; '.join(calc_notes)}."
+
         result = judgment
 
         caution_reasons: list[str] = []
@@ -1863,7 +1984,9 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
     for line in note_lines:
         if line.interest_rates:
             continue
-        if not is_borrowing_amount_context(line.context):
+        if not is_borrowing_amount_context(line.context) and not (
+            is_total_amount_context(line.context) and is_borrowing_target_context(line.context)
+        ):
             continue
         amount = extract_current_amount(line)
         if amount is None:
@@ -1923,7 +2046,7 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
 
     total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
     if total_candidates:
-        selected_line, selected_amount = max(total_candidates, key=lambda item: item[1])
+        selected_line, selected_amount = select_total_amount_candidate(total_candidates)
         if selected_amount == 0 and rate_amount_candidates:
             amount_sum = sum(amount for _, amount in rate_amount_candidates)
             max_amount = max((amount for _, amount in rate_amount_candidates), default=0)
@@ -1975,6 +2098,17 @@ def financial_statement_borrowing_amount(lines: list[BorrowingLine]) -> tuple[in
     return amount, selected_line
 
 
+def select_total_amount_candidate(candidates: list[tuple[BorrowingLine, int]]) -> tuple[BorrowingLine, int]:
+    positive = [(line, amount) for line, amount in candidates if amount > 0]
+    if not positive:
+        return max(candidates, key=lambda item: item[1])
+    min_amount = min(amount for _, amount in positive)
+    max_amount = max(amount for _, amount in positive)
+    if min_amount > 0 and max_amount / min_amount > 20:
+        return min(positive, key=lambda item: item[1])
+    return max(positive, key=lambda item: item[1])
+
+
 def extract_current_amount(line: BorrowingLine) -> int | None:
     if is_current_period_zero_amount(line.context):
         return 0
@@ -2000,6 +2134,8 @@ def borrowing_amount_unit_for_context(value: int, unit: str, context: str) -> st
         return compact_unit
     if compact_unit == "원":
         return compact_unit
+    if compact_unit == "억원" and compact_unit not in compact_context and value >= 1_000_000:
+        return "천원"
     if compact_unit == "억원" and compact_unit not in compact_context and value >= 100_000:
         return "백만원"
     return compact_unit
@@ -2012,7 +2148,7 @@ def is_current_period_zero_amount(text: str) -> bool:
 def normalize_amount_to_million(value: int, unit: str) -> int:
     compact = re.sub(r"\s+", "", unit or "")
     if compact == "":
-        if value >= 10_000_000_000:
+        if value >= 100_000_000:
             return round(value / 1_000_000)
         return value
     if "십억원" in compact:
@@ -2264,6 +2400,8 @@ def is_explanatory_interest_expense_context(text: str) -> bool:
             "절감을위한",
             "조기상환",
             "상환에따라",
+            "이자비용조정",
+            "조정내역",
         )
     )
 
@@ -2655,7 +2793,7 @@ def is_borrowing_target_context(text: str) -> bool:
 def is_valid_borrowing_rate_line(line: BorrowingLine) -> bool:
     if not line.interest_rates:
         return False
-    if not is_borrowing_note_section(line.section):
+    if not is_borrowing_note_section(line.section) and not is_borrowing_rate_table_context(line.context):
         return False
     if not is_borrowing_target_context(line.context):
         return False
@@ -2665,6 +2803,23 @@ def is_valid_borrowing_rate_line(line: BorrowingLine) -> bool:
 def is_borrowing_note_section(section: str) -> bool:
     compact = re.sub(r"\s+", "", section or "")
     return "차입금" in compact or "사채" in compact
+
+
+def is_borrowing_rate_table_context(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if any(keyword in compact for keyword in ("이자비용", "금융비용", "금융수익", "상각후원가")):
+        return False
+    strong_keywords = (
+        "차입처",
+        "이자율",
+        "단기차입금",
+        "장기차입금",
+        "유동성장기차입금",
+        "전환사채",
+        "최종만기",
+        "일반자금대출",
+    )
+    return any(keyword in compact for keyword in strong_keywords)
 
 
 def is_valid_borrowing_rate_context(text: str, allow_mixed_lease: bool = False) -> bool:
@@ -2785,18 +2940,21 @@ def weighted_average_interest_rate(
     weight_total = 0.0
     amount_total = 0
     default_days = report_period_days(period_key, default_months)
-    seen_contexts: set[str] = set()
+    seen_contexts: set[tuple[float, int]] = set()
     for line in lines:
-        key = normalize_text(line.context)
-        if key in seen_contexts:
-            continue
-        seen_contexts.add(key)
         line_rate = representative_interest_rate_for_weighting(line)
         if line_rate is None:
             continue
         amount = extract_current_amount(line)
         if amount is None or amount <= 0:
             continue
+        amount = normalize_rate_line_amount(amount, reference_amount)
+        if amount is None:
+            continue
+        key = (round(line_rate, 8), amount)
+        if key in seen_contexts:
+            continue
+        seen_contexts.add(key)
         days = interest_rate_weight_days(line.context, period_key, default_days)
         if days <= 0:
             continue
@@ -2808,6 +2966,59 @@ def weighted_average_interest_rate(
     if reference_amount > 0 and amount_total < reference_amount * 0.5:
         return None
     return weighted_sum / weight_total
+
+
+def rate_line_interest_estimate(
+    lines: list[BorrowingLine],
+    reference_amount: int,
+    period_key: tuple[int, int] | None,
+    default_months: int,
+) -> RateInterestEstimate | None:
+    weighted_sum = 0.0
+    weight_total = 0.0
+    expected_interest = 0.0
+    amount_total = 0.0
+    line_count = 0
+    default_days = report_period_days(period_key, default_months)
+    seen_contexts: set[tuple[float, int]] = set()
+    for line in lines:
+        line_rate = representative_interest_rate_for_weighting(line)
+        if line_rate is None:
+            continue
+        amount = extract_current_amount(line)
+        if amount is None or amount <= 0:
+            continue
+        amount = normalize_rate_line_amount(amount, reference_amount)
+        if amount is None:
+            continue
+        key = (round(line_rate, 8), amount)
+        if key in seen_contexts:
+            continue
+        seen_contexts.add(key)
+        days = interest_rate_weight_days(line.context, period_key, default_days)
+        if days <= 0:
+            continue
+        weighted_sum += line_rate * amount * days
+        weight_total += amount * days
+        expected_interest += line_rate * amount * days / 365
+        amount_total += amount
+        line_count += 1
+    if not weight_total:
+        return None
+    if reference_amount > 0 and amount_total < reference_amount * 0.3:
+        return None
+    return RateInterestEstimate(weighted_sum / weight_total, amount_total, expected_interest, line_count)
+
+
+def normalize_rate_line_amount(amount: int, reference_amount: int) -> int | None:
+    if reference_amount <= 0:
+        return amount
+    if amount <= reference_amount * 1.5:
+        return amount
+    scaled = round(amount / 1_000)
+    if 0 < scaled <= reference_amount * 1.5:
+        return scaled
+    return None
 
 
 def report_period_days(period_key: tuple[int, int] | None, default_months: int) -> int:
@@ -2828,7 +3039,7 @@ def interest_rate_weight_days(text: str, period_key: tuple[int, int] | None, def
     if period_key:
         period_start, period_end = report_period_dates(period_key)
         dates = extract_dates(text)
-        if dates:
+        if len(dates) >= 2:
             start = max(period_start, min(dates))
             end = min(period_end, max(dates))
             if start <= end:
