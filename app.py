@@ -131,19 +131,6 @@ class BorrowingMovementEstimate:
     method: str
 
 
-@dataclass
-class InterestTest:
-    corp_name: str
-    report_name: str
-    receipt_no: str
-    borrowing_amount: float | None
-    interest_rate: float | None
-    expected_interest: float | None
-    actual_interest: float | None
-    error_rate: float | None
-    result: str
-
-
 class DartClient:
     def __init__(self, api_key: str):
         self.api_key = api_key.strip()
@@ -654,17 +641,18 @@ def beginning_borrowing_amount(
     if not period_key:
         return None, "평균차입금: 보고기간 식별 실패"
 
-    year, _ = period_key
-    prior_year_end_report = latest_report_by_period.get((year - 1, 12))
-    if prior_year_end_report:
-        beginning_amount = amount_cache.get(prior_year_end_report.receipt_no, (None, 0, "", []))[0]
+    year, month = period_key
+    beginning_period = (year, 6) if month == 9 else (year - 1, 12)
+    beginning_report = latest_report_by_period.get(beginning_period)
+    if beginning_report:
+        beginning_amount = amount_cache.get(beginning_report.receipt_no, (None, 0, "", []))[0]
         if beginning_amount is not None:
             return (
                 beginning_amount,
-                f"평균차입금: 전기말 {report_period_label(prior_year_end_report)} 차입잔액 {beginning_amount:,}백만원과 당기말 차입잔액 평균",
+                f"평균차입금: 기초 {report_period_label(beginning_report)} 차입잔액 {beginning_amount:,}백만원과 기말 차입잔액 평균",
             )
 
-    return None, "평균차입금: 전기말 재무상태표 차입잔액 미검출"
+    return None, f"평균차입금: 기초 {beginning_period[0]}.{beginning_period[1]:02d} 차입잔액 미검출"
 
 
 def movement_adjusted_average_borrowing_balance(
@@ -1671,21 +1659,6 @@ def build_special_matter(text: str) -> str:
     return ", ".join(flags) if flags else "특이사항 자동 식별 없음. 원문 주석 확인 필요."
 
 
-def interest_test_from_note(note: BorrowingNote) -> InterestTest:
-    amount = extract_amount(note.summary)
-    rate = extract_rate(note.summary)
-    actual = extract_actual_interest(note.summary)
-    expected = amount * rate / 100 if amount is not None and rate is not None else None
-    error = (actual - expected) / expected * 100 if actual is not None and expected not in (None, 0) else None
-    if error is None:
-        result = "계산 정보 부족"
-    elif abs(error) <= 5:
-        result = "적정"
-    else:
-        result = "검토 필요"
-    return InterestTest(note.corp_name, note.report_name, note.receipt_no, amount, rate, expected, actual, error, result)
-
-
 def interest_judgment_basis(
     expected: float,
     actual: float,
@@ -1804,13 +1777,13 @@ def build_overall_tests(
             average_borrowing_balance = (beginning_amount + amount_sum) / 2
         elif amount_sum > 0:
             average_borrowing_balance = amount_sum
-            average_method = "평균차입금: 전기말 잔액을 찾지 못해 당기말 잔액 사용"
+            average_method = "평균차입금: 기초 잔액을 찾지 못해 기말 잔액 사용"
         elif has_amount_candidate and beginning_amount is not None and beginning_amount > 0:
             average_borrowing_balance = beginning_amount / 2
-            average_method = f"평균차입금: 당기말 잔액 0, 전기말 잔액 {beginning_amount:,}백만원의 절반 사용"
+            average_method = f"평균차입금: 기말 잔액 0, 기초 잔액 {beginning_amount:,}백만원의 절반 사용"
         else:
             average_borrowing_balance = None
-            average_method = "평균차입금: 전기말 및 당기말 차입잔액 부족"
+            average_method = "평균차입금: 기초 및 기말 차입잔액 부족"
         period_factor = period_months / 12
         revenue = revenues.get(report.receipt_no, 0)
         materiality_threshold = materiality_threshold_from_revenue(revenue) if revenue > 0 else 0
@@ -1850,7 +1823,7 @@ def build_overall_tests(
             )
             actual_interest_comparable = True
             if abs(disclosure_diff) <= materiality_threshold:
-                judgment = "적정"
+                judgment = "기준 이내"
                 judgment_basis = disclosure_interest_judgment_basis(
                     reference_interest,
                     disclosed_interest,
@@ -1860,7 +1833,7 @@ def build_overall_tests(
                     "주석 간 대사 차이 PM/3 이하임.",
                 )
             else:
-                judgment = "확인필요"
+                judgment = "추가 확인 필요"
                 judgment_basis = disclosure_interest_judgment_basis(
                     reference_interest,
                     disclosed_interest,
@@ -1882,13 +1855,13 @@ def build_overall_tests(
             judgment = "판단불가"
             judgment_basis = "금융비용 대체값 사용. 외환손익 등 혼재 가능하여 판정 제외함."
         elif avg_rate is None:
-            judgment = "확인필요"
+            judgment = "추가 확인 필요"
             judgment_basis = f"금융비용 주석의 이자비용 {actual_interest_expense:,.0f}백만원을 실제 이자비용으로 사용. 차입금/사채 주석의 이자율 표기 확인 필요."
         elif expected_interest_expense is None:
             judgment = "판단불가"
             judgment_basis = "평균차입금 또는 이자율 부족. 예상이자 산정불가."
         elif interest_expense_diff is not None and abs(interest_expense_diff) <= materiality_threshold:
-            judgment = "적정"
+            judgment = "기준 이내"
             judgment_basis = interest_judgment_basis(
                 expected_interest_expense,
                 actual_interest_expense,
@@ -1901,7 +1874,7 @@ def build_overall_tests(
                 "계산이자와 실제이자 차이 PM/3 이하임.",
             )
         else:
-            judgment = "확인필요"
+            judgment = "추가 확인 필요"
             judgment_basis = interest_judgment_basis(
                 expected_interest_expense,
                 actual_interest_expense,
@@ -1918,11 +1891,11 @@ def build_overall_tests(
         if rate_interest_estimate is not None and expected_interest_expense is not None:
             calc_notes.append(
                 f"금리 있는 차입금/사채 {rate_interest_estimate.covered_amount:,.0f}백만원 "
-                f"{rate_interest_estimate.line_count}개 행을 금액·기간 가중으로 직접 계산"
+                f"{rate_interest_estimate.line_count}개 행을 금액, 기간 가중으로 직접 계산"
             )
         if conversion_amortization:
             calc_notes.append(f"전환권조정 상각 {conversion_amortization:,.0f}백만원 가산")
-        if calc_notes and expected_interest_expense is not None and judgment in ("적정", "확인필요"):
+        if calc_notes and expected_interest_expense is not None and judgment in ("기준 이내", "추가 확인 필요"):
             judgment_basis = f"{judgment_basis} 산정 보정: {'; '.join(calc_notes)}."
 
         result = judgment
@@ -3032,7 +3005,8 @@ def report_period_dates(period_key: tuple[int, int]) -> tuple[date, date]:
     year, month = period_key
     month = max(1, min(month, 12))
     end_day = calendar.monthrange(year, month)[1]
-    return date(year, 1, 1), date(year, month, end_day)
+    start_month = 7 if month == 9 else 1
+    return date(year, start_month, 1), date(year, month, end_day)
 
 
 def interest_rate_weight_days(text: str, period_key: tuple[int, int] | None, default_days: int) -> int:
@@ -3239,12 +3213,12 @@ def is_sofr_equivalent_benchmark_spread(text: str, rate_start: int) -> bool:
     prefix = re.sub(r"\s+", "", text[max(0, rate_start - 40) : rate_start]).lower()
     if not prefix.endswith("+"):
         return False
-    return any(keyword in prefix for keyword in ("libor", "sofr"))
+    return "sofr" in prefix
 
 
 def is_unknown_benchmark_spread(text: str, rate_start: int) -> bool:
     prefix = re.sub(r"\s+", "", text[max(0, rate_start - 40) : rate_start]).lower()
-    return prefix.endswith("+") and not any(keyword in prefix for keyword in ("libor", "sofr"))
+    return prefix.endswith("+") and "sofr" not in prefix
 
 
 def is_decimal_rate_context(text: str) -> bool:
@@ -3396,7 +3370,7 @@ def save_workbook(
                 "이자비용차이",
                 "이자비용계정",
                 "평균차입금",
-                "검출평균이자율",
+                "가중평균이자율",
                 "최저차입이자율",
                 "최고차입이자율",
                 "대상기간(개월)",
@@ -3987,7 +3961,7 @@ HTML_PAGE = r"""
       <div class="steps">
         <div class="step">1. 최근 5년치 정기보고서 목록을 수집합니다.</div>
         <div class="step">2. 차입금, 사채, 이자율 관련 주석을 필터링합니다.</div>
-        <div class="step">3. ±5% 기준으로 이자율 오버롤 테스트 결과를 산출합니다.</div>
+        <div class="step">3. 예상 이자비용과 실제 이자비용의 차이를 PoC 검토 기준과 비교합니다.</div>
       </div>
       <table>
         <thead><tr><th>항목</th><th>건수</th></tr></thead>
