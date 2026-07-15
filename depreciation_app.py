@@ -16,7 +16,7 @@ import zipfile
 import app
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = app.runtime_root()
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 

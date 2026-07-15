@@ -25,7 +25,13 @@ import tkinter.font as tkfont
 from xml.etree import ElementTree
 
 
-ROOT = Path(__file__).resolve().parent
+def runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = runtime_root()
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 UI_DEBUG_PATH = OUTPUT_DIR / "ui_debug.log"
@@ -129,6 +135,48 @@ class ExtractionIssue:
 class BorrowingMovementEstimate:
     average_balance: float
     method: str
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialBenchmarks:
+    revenue: int | None = None
+    profit_before_tax: int | None = None
+    total_assets: int | None = None
+    total_equity: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialityPreset:
+    preset_id: str
+    label: str
+    benchmark_key: str
+    benchmark_label: str
+    benchmark_rate: float
+    test_fraction: float = 0.25
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialityResult:
+    preset: MaterialityPreset
+    benchmark_amount: int | None
+    threshold: float | None
+
+    @property
+    def available(self) -> bool:
+        return self.benchmark_amount is not None and self.benchmark_amount > 0 and self.threshold is not None
+
+
+MATERIALITY_PRESETS = {
+    preset.preset_id: preset
+    for preset in (
+        MaterialityPreset("revenue_1", "매출액 1% × 25% (기본)", "revenue", "매출액", 0.01),
+        MaterialityPreset("revenue_05", "매출액 0.5% × 25% (보수적)", "revenue", "매출액", 0.005),
+        MaterialityPreset("pbt_5", "세전이익 5% × 25%", "profit_before_tax", "세전이익", 0.05),
+        MaterialityPreset("assets_05", "총자산 0.5% × 25%", "total_assets", "총자산", 0.005),
+        MaterialityPreset("equity_1", "자본총계 1% × 25%", "total_equity", "자본총계", 0.01),
+    )
+}
+DEFAULT_MATERIALITY_PRESET_ID = "revenue_1"
 
 
 class DartClient:
@@ -296,20 +344,40 @@ class DartClient:
         )
 
     def extract_revenue(self, corp_code: str, report: DartReport) -> int | None:
+        return self.extract_financial_benchmarks(corp_code, report).revenue
+
+    def extract_financial_benchmarks(self, corp_code: str, report: DartReport) -> FinancialBenchmarks:
         rows = self.get_financial_statement_rows(corp_code, report)
         revenues: list[int] = []
+        profits_before_tax: list[int] = []
+        total_assets: list[int] = []
+        total_equity: list[int] = []
         for row in rows:
             statement_name = normalize_text(row.get("sj_nm", ""))
-            if not is_income_statement_name(statement_name):
-                continue
             account = normalize_text(row.get("account_nm", ""))
             account_id = normalize_text(row.get("account_id", ""))
-            if not is_revenue_account(account, account_id):
-                continue
-            amount = revenue_amount_for_report(row, report)
-            if amount is not None and amount > 0:
-                revenues.append(amount // 1_000_000)
-        return max(revenues) if revenues else None
+            if is_income_statement_name(statement_name):
+                amount = income_statement_amount_for_report(row, report)
+                if amount is None:
+                    continue
+                if is_revenue_account(account, account_id) and amount > 0:
+                    revenues.append(amount // 1_000_000)
+                if is_profit_before_tax_account(account, account_id):
+                    profits_before_tax.append(round(amount / 1_000_000))
+            elif statement_name == "재무상태표":
+                amount = parse_signed_dart_amount(row.get("thstrm_amount", ""))
+                if amount is None:
+                    continue
+                if is_total_assets_account(account, account_id) and amount > 0:
+                    total_assets.append(amount // 1_000_000)
+                if is_total_equity_account(account, account_id) and amount > 0:
+                    total_equity.append(amount // 1_000_000)
+        return FinancialBenchmarks(
+            revenue=max(revenues) if revenues else None,
+            profit_before_tax=max(profits_before_tax, key=abs) if profits_before_tax else None,
+            total_assets=max(total_assets) if total_assets else None,
+            total_equity=max(total_equity) if total_equity else None,
+        )
 
     def extract_borrowing_note(self, report: DartReport) -> BorrowingNote | None:
         files = self.get_document_texts(report.receipt_no)
@@ -426,16 +494,19 @@ def run_report(payload: dict) -> dict:
     now_year = datetime.now().year
     begin_year = int(payload.get("beginYear") or now_year - 4)
     end_year = int(payload.get("endYear") or now_year)
+    materiality_preset_id = str(payload.get("materialityPreset") or DEFAULT_MATERIALITY_PRESET_ID)
+    if materiality_preset_id not in MATERIALITY_PRESETS:
+        return fail("알 수 없는 중요성 프리셋입니다. 화면에서 기준을 다시 선택해 주세요.")
 
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
     borrowing_lines: list[BorrowingLine] = []
-    revenues: dict[str, int] = {}
+    financial_benchmarks: dict[str, FinancialBenchmarks] = {}
     issues: list[ExtractionIssue] = []
 
-    def process_report(report: DartReport) -> tuple[DartReport, list[BorrowingLine], int | None, list[ExtractionIssue]]:
+    def process_report(report: DartReport) -> tuple[DartReport, list[BorrowingLine], FinancialBenchmarks, list[ExtractionIssue]]:
         report_lines: list[BorrowingLine] = []
         report_issues: list[ExtractionIssue] = []
-        report_revenue: int | None = None
+        report_benchmarks = FinancialBenchmarks()
         try:
             financial_line = client.extract_financial_borrowing_line(corp.corp_code, report)
             if financial_line is not None:
@@ -443,39 +514,36 @@ def run_report(payload: dict) -> dict:
         except Exception as exc:
             report_issues.append(extraction_issue(report, "financial_statement", exc))
         try:
-            revenue = client.extract_revenue(corp.corp_code, report)
-            if revenue is not None:
-                report_revenue = revenue
+            report_benchmarks = client.extract_financial_benchmarks(corp.corp_code, report)
         except Exception as exc:
-            report_issues.append(extraction_issue(report, "revenue", exc))
+            report_issues.append(extraction_issue(report, "materiality_benchmark", exc))
         try:
             report_lines.extend(client.extract_borrowing_lines(report))
         except Exception as exc:
             report_issues.append(extraction_issue(report, "borrowing_note", exc))
-        return report, report_lines, report_revenue, report_issues
+        return report, report_lines, report_benchmarks, report_issues
 
     max_workers = min(4, max(1, len(reports)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {executor.submit(process_report, report): report for report in reports}
-        processed: dict[str, tuple[list[BorrowingLine], int | None, list[ExtractionIssue]]] = {}
+        processed: dict[str, tuple[list[BorrowingLine], FinancialBenchmarks, list[ExtractionIssue]]] = {}
         for future in as_completed(future_map):
             try:
-                report, report_lines, revenue, report_issues = future.result()
+                report, report_lines, benchmarks, report_issues = future.result()
             except Exception as exc:
                 report = future_map[future]
                 report_lines = []
-                revenue = None
+                benchmarks = FinancialBenchmarks()
                 report_issues = [extraction_issue(report, "report_worker", exc)]
-            processed[report.receipt_no] = (report_lines, revenue, report_issues)
+            processed[report.receipt_no] = (report_lines, benchmarks, report_issues)
 
     for report in reports:
-        report_lines, revenue, report_issues = processed.get(report.receipt_no, ([], None, []))
+        report_lines, benchmarks, report_issues = processed.get(report.receipt_no, ([], FinancialBenchmarks(), []))
         borrowing_lines.extend(report_lines)
-        if revenue is not None:
-            revenues[report.receipt_no] = revenue
+        financial_benchmarks[report.receipt_no] = benchmarks
         issues.extend(report_issues)
 
-    tests = build_overall_tests(reports, borrowing_lines, revenues)
+    tests = build_overall_tests(reports, borrowing_lines, financial_benchmarks, materiality_preset_id)
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests, issues)
@@ -488,6 +556,8 @@ def run_report(payload: dict) -> dict:
         "noteCount": len(borrowing_lines),
         "testCount": len(tests),
         "issueCount": len(issues),
+        "materialityPreset": materiality_preset_id,
+        "materialityPresetLabel": MATERIALITY_PRESETS[materiality_preset_id].label,
     }
 
 
@@ -785,26 +855,40 @@ def normalize_movement_amount_to_million(value: int, unit: str) -> int:
 
 
 def parse_dart_amount(value: str) -> int | None:
+    amount = parse_signed_dart_amount(value)
+    return abs(amount) if amount is not None else None
+
+
+def parse_signed_dart_amount(value: str) -> int | None:
     cleaned = str(value or "").replace(",", "").strip()
     if not cleaned or cleaned == "-":
         return None
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
     try:
-        return abs(int(cleaned))
+        amount = int(cleaned)
+        return -abs(amount) if negative else amount
     except ValueError:
         return None
 
 
-def revenue_amount_for_report(row: dict, report: DartReport) -> int | None:
+def income_statement_amount_for_report(row: dict, report: DartReport) -> int | None:
     report_name = re.sub(r"\s+", "", report.report_name)
     if "반기보고서" in report_name:
         preferred_fields = ("thstrm_add_amount", "thstrm_amount")
     else:
         preferred_fields = ("thstrm_amount", "thstrm_add_amount")
     for field in preferred_fields:
-        amount = parse_dart_amount(row.get(field, ""))
-        if amount is not None and amount > 0:
+        amount = parse_signed_dart_amount(row.get(field, ""))
+        if amount is not None:
             return amount
     return None
+
+
+def revenue_amount_for_report(row: dict, report: DartReport) -> int | None:
+    amount = income_statement_amount_for_report(row, report)
+    return amount if amount is not None and amount > 0 else None
 
 
 def is_financial_borrowing_account(account: str) -> bool:
@@ -857,6 +941,28 @@ def is_revenue_account(account: str, account_id: str = "") -> bool:
         or compact.endswith("매출액")
         or compact.startswith(("매출액(", "수익("))
     )
+
+
+def is_profit_before_tax_account(account: str, account_id: str = "") -> bool:
+    if account_id == "ifrs-full_ProfitLossBeforeTax":
+        return True
+    compact = re.sub(r"\s+", "", account)
+    return compact in {
+        "법인세비용차감전순이익(손실)",
+        "법인세비용차감전이익(손실)",
+        "법인세비용차감전순이익",
+        "법인세비용차감전이익",
+        "세전이익(손실)",
+        "세전이익",
+    }
+
+
+def is_total_assets_account(account: str, account_id: str = "") -> bool:
+    return account_id == "ifrs-full_Assets" or re.sub(r"\s+", "", account) == "자산총계"
+
+
+def is_total_equity_account(account: str, account_id: str = "") -> bool:
+    return account_id == "ifrs-full_Equity" or re.sub(r"\s+", "", account) in {"자본총계", "소유주지분"}
 
 
 def clean_context(value: str) -> str:
@@ -1666,8 +1772,7 @@ def interest_judgment_basis(
     average_balance: float,
     avg_rate: float,
     period_months: int,
-    revenue: int,
-    materiality_threshold: float,
+    materiality: MaterialityResult,
     verdict_text: str,
 ) -> str:
     parts = [
@@ -1677,7 +1782,7 @@ def interest_judgment_basis(
     ]
     if diff is not None:
         parts.append(f"차이 {diff:,.0f}백만원.")
-        parts.append(materiality_comparison_basis(diff, revenue, materiality_threshold))
+        parts.append(materiality_comparison_basis(diff, materiality))
     return " ".join(parts)
 
 
@@ -1685,15 +1790,36 @@ def materiality_threshold_from_revenue(revenue: int) -> float:
     return revenue * 0.01 * 0.25
 
 
+def materiality_for_benchmarks(
+    benchmarks: FinancialBenchmarks,
+    preset_id: str = DEFAULT_MATERIALITY_PRESET_ID,
+) -> MaterialityResult:
+    preset = MATERIALITY_PRESETS.get(preset_id, MATERIALITY_PRESETS[DEFAULT_MATERIALITY_PRESET_ID])
+    amount = getattr(benchmarks, preset.benchmark_key, None)
+    threshold = amount * preset.benchmark_rate * preset.test_fraction if amount is not None and amount > 0 else None
+    return MaterialityResult(preset, amount, threshold)
+
+
 def absolute_amount_diff(left: float, right: float) -> float:
     return abs(abs(left) - abs(right))
 
 
-def materiality_comparison_basis(diff: float, revenue: int, materiality_threshold: float) -> str:
-    operator = "<=" if abs(diff) <= materiality_threshold else ">"
+def materiality_formula_text(materiality: MaterialityResult) -> str:
+    preset = materiality.preset
+    amount_text = f"{materiality.benchmark_amount:,.0f}" if materiality.benchmark_amount is not None else "미검출"
     return (
-        f"기준 |차이| {abs(diff):,.0f}백만원 {operator} 중요성 {materiality_threshold:,.0f}백만원"
-        f"(매출액 {revenue:,.0f} × 1% × 25%)."
+        f"{preset.benchmark_label} {amount_text}백만원 × "
+        f"{preset.benchmark_rate:.2%} × {preset.test_fraction:.0%}"
+    )
+
+
+def materiality_comparison_basis(diff: float, materiality: MaterialityResult) -> str:
+    if not materiality.available or materiality.threshold is None:
+        return f"중요성 산정불가({materiality_formula_text(materiality)})."
+    operator = "<=" if abs(diff) <= materiality.threshold else ">"
+    return (
+        f"기준 |차이| {abs(diff):,.0f}백만원 {operator} 허용차이 {materiality.threshold:,.0f}백만원"
+        f"({materiality_formula_text(materiality)})."
     )
 
 
@@ -1701,21 +1827,25 @@ def disclosure_interest_judgment_basis(
     reference: float,
     actual: float,
     diff: float,
-    revenue: int,
-    materiality_threshold: float,
+    materiality: MaterialityResult,
     verdict_text: str,
 ) -> str:
     return (
         f"{verdict_text} 금융비용 주석 {reference:,.0f}백만원 vs 상각후원가 금융부채 주석 {actual:,.0f}백만원. "
-        f"차이 {diff:,.0f}백만원. {materiality_comparison_basis(diff, revenue, materiality_threshold)}"
+        f"차이 {diff:,.0f}백만원. {materiality_comparison_basis(diff, materiality)}"
     )
 
 def build_overall_tests(
     reports: list[DartReport],
     lines: list[BorrowingLine],
-    revenues: dict[str, int] | None = None,
+    financial_benchmarks: dict[str, FinancialBenchmarks] | dict[str, int] | None = None,
+    materiality_preset_id: str = DEFAULT_MATERIALITY_PRESET_ID,
 ) -> list[dict]:
-    revenues = revenues or {}
+    raw_benchmarks = financial_benchmarks or {}
+    normalized_benchmarks: dict[str, FinancialBenchmarks] = {
+        receipt_no: value if isinstance(value, FinancialBenchmarks) else FinancialBenchmarks(revenue=value)
+        for receipt_no, value in raw_benchmarks.items()
+    }
     by_receipt: dict[str, list[BorrowingLine]] = {}
     for line in lines:
         by_receipt.setdefault(line.receipt_no, []).append(line)
@@ -1785,8 +1915,9 @@ def build_overall_tests(
             average_borrowing_balance = None
             average_method = "평균차입금: 기초 및 기말 차입잔액 부족"
         period_factor = period_months / 12
-        revenue = revenues.get(report.receipt_no, 0)
-        materiality_threshold = materiality_threshold_from_revenue(revenue) if revenue > 0 else 0
+        benchmarks = normalized_benchmarks.get(report.receipt_no, FinancialBenchmarks())
+        materiality = materiality_for_benchmarks(benchmarks, materiality_preset_id)
+        materiality_threshold = materiality.threshold
         financial_expense = extract_note_interest_expense(report_lines) or FinancialExpense(report.receipt_no, None, "", "금융비용 주석 이자비용 정보 없음")
         actual_interest_expense = financial_expense.actual_interest_expense
         actual_interest_comparable = actual_interest_expense is not None and is_exact_interest_expense_account(financial_expense.account_name)
@@ -1822,15 +1953,23 @@ def build_overall_tests(
                 "금융비용 주석 이자비용과 상각후원가 금융부채 이자비용 대사",
             )
             actual_interest_comparable = True
-            if abs(disclosure_diff) <= materiality_threshold:
+            if not materiality.available or materiality_threshold is None:
+                judgment = "판단불가"
+                judgment_basis = disclosure_interest_judgment_basis(
+                    reference_interest,
+                    disclosed_interest,
+                    disclosure_diff,
+                    materiality,
+                    f"선택한 프리셋의 {materiality.preset.benchmark_label}이 없거나 0 이하임.",
+                )
+            elif abs(disclosure_diff) <= materiality_threshold:
                 judgment = "기준 이내"
                 judgment_basis = disclosure_interest_judgment_basis(
                     reference_interest,
                     disclosed_interest,
                     disclosure_diff,
-                    revenue,
-                    materiality_threshold,
-                    "주석 간 대사 차이 PM/3 이하임.",
+                    materiality,
+                    "주석 간 대사 차이가 선택한 허용차이 이내임.",
                 )
             else:
                 judgment = "추가 확인 필요"
@@ -1838,9 +1977,8 @@ def build_overall_tests(
                     reference_interest,
                     disclosed_interest,
                     disclosure_diff,
-                    revenue,
-                    materiality_threshold,
-                    "주석 간 대사 차이 PM/3 초과함.",
+                    materiality,
+                    "주석 간 대사 차이가 선택한 허용차이를 초과함.",
                 )
         elif not has_amount_candidate or average_borrowing_balance in (None, 0):
             judgment = "판단불가"
@@ -1860,6 +1998,12 @@ def build_overall_tests(
         elif expected_interest_expense is None:
             judgment = "판단불가"
             judgment_basis = "평균차입금 또는 이자율 부족. 예상이자 산정불가."
+        elif not materiality.available or materiality_threshold is None:
+            judgment = "판단불가"
+            judgment_basis = (
+                f"선택한 프리셋의 {materiality.preset.benchmark_label}이 없거나 0 이하이므로 허용차이를 산정할 수 없음. "
+                f"{materiality_formula_text(materiality)}."
+            )
         elif interest_expense_diff is not None and abs(interest_expense_diff) <= materiality_threshold:
             judgment = "기준 이내"
             judgment_basis = interest_judgment_basis(
@@ -1869,9 +2013,8 @@ def build_overall_tests(
                 average_borrowing_balance,
                 avg_rate,
                 period_months,
-                revenue,
-                materiality_threshold,
-                "계산이자와 실제이자 차이 PM/3 이하임.",
+                materiality,
+                "계산이자와 실제이자 차이가 선택한 허용차이 이내임.",
             )
         else:
             judgment = "추가 확인 필요"
@@ -1882,9 +2025,8 @@ def build_overall_tests(
                 average_borrowing_balance,
                 avg_rate,
                 period_months,
-                revenue,
-                materiality_threshold,
-                "계산이자와 실제이자 차이 PM/3 초과함.",
+                materiality,
+                "계산이자와 실제이자 차이가 선택한 허용차이를 초과함.",
             )
 
         calc_notes: list[str] = []
@@ -1939,6 +2081,13 @@ def build_overall_tests(
                 "interest_expense_diff": interest_expense_diff,
                 "interest_expense_error_rate": interest_expense_error_rate,
                 "interest_expense_memo": financial_expense.memo,
+                "materiality_preset_id": materiality.preset.preset_id,
+                "materiality_preset": materiality.preset.label,
+                "materiality_benchmark": materiality.preset.benchmark_label,
+                "materiality_benchmark_amount": materiality.benchmark_amount,
+                "materiality_benchmark_rate": materiality.preset.benchmark_rate,
+                "materiality_test_fraction": materiality.preset.test_fraction,
+                "materiality_threshold": materiality.threshold,
                 "judgment": judgment,
                 "judgment_basis": judgment_basis,
                 "result": result,
@@ -3365,6 +3514,12 @@ def save_workbook(
                 "보고서명",
                 "판정",
                 "판정근거",
+                "중요성프리셋",
+                "기준항목",
+                "기준금액",
+                "중요성비율",
+                "테스트적용률",
+                "허용차이",
                 "예상이자비용",
                 "실제이자비용",
                 "이자비용차이",
@@ -3389,6 +3544,12 @@ def save_workbook(
                     t["report_name"],
                     t["judgment"],
                     t["judgment_basis"],
+                    t["materiality_preset"],
+                    t["materiality_benchmark"],
+                    t["materiality_benchmark_amount"],
+                    t["materiality_benchmark_rate"],
+                    t["materiality_test_fraction"],
+                    t["materiality_threshold"],
                     t["expected_interest_expense"],
                     t["actual_interest_expense"],
                     t["interest_expense_diff"],
@@ -3409,7 +3570,7 @@ def save_workbook(
                 ]
                 for t in tests
             ],
-            {5: 2, 6: 2, 7: 2, 9: 2, 10: 3, 11: 3, 12: 3, 13: 2, 14: 2, 16: 3, 17: 2, 20: 2},
+            {7: 2, 8: 3, 9: 3, 10: 2, 11: 2, 12: 2, 13: 2, 15: 2, 16: 3, 17: 3, 18: 3, 19: 2, 20: 2, 22: 3, 23: 2},
         ),
     ]
     sheets.append(
@@ -3614,6 +3775,11 @@ class DartOtApp(tk.Tk):
         self.corp_code_var = tk.StringVar()
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
         self.end_year_var = tk.StringVar(value=str(datetime.now().year))
+        saved_preset = self.config.get("materiality_preset", DEFAULT_MATERIALITY_PRESET_ID)
+        if saved_preset not in MATERIALITY_PRESETS:
+            saved_preset = DEFAULT_MATERIALITY_PRESET_ID
+        self.materiality_preset_var = tk.StringVar(value=saved_preset)
+        self.materiality_preset_display_var = tk.StringVar(value=MATERIALITY_PRESETS[saved_preset].label)
         self.status_var = tk.StringVar(value="DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요.")
         self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
 
@@ -3669,6 +3835,28 @@ class DartOtApp(tk.Tk):
         year_frame.columnconfigure(1, weight=1)
         self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
         self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
+
+        preset_frame = ttk.Frame(left, style="Panel.TFrame")
+        preset_frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(preset_frame, text="중요성 프리셋", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        preset_combo = ttk.Combobox(
+            preset_frame,
+            state="readonly",
+            textvariable=self.materiality_preset_display_var,
+            values=[preset.label for preset in MATERIALITY_PRESETS.values()],
+            width=28,
+        )
+        preset_combo.pack(fill="x")
+        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_materiality_preset())
+        self.materiality_help_var = tk.StringVar()
+        ttk.Label(
+            preset_frame,
+            textvariable=self.materiality_help_var,
+            style="Panel.TLabel",
+            wraplength=300,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        self._update_materiality_help()
 
         ttk.Button(left, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(18, 8))
         ttk.Button(left, text="엑셀 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
@@ -3736,6 +3924,21 @@ class DartOtApp(tk.Tk):
         self.company_entry.bind("<Return>", lambda _event: self.search_company())
         self.company_entry.bind("<KeyRelease>", self.log_company_entry_state)
         self.log_company_entry_state()
+
+    def _update_materiality_help(self) -> None:
+        preset = MATERIALITY_PRESETS.get(
+            self.materiality_preset_var.get(),
+            MATERIALITY_PRESETS[DEFAULT_MATERIALITY_PRESET_ID],
+        )
+        self.materiality_help_var.set(f"{preset.label}\n감사기준의 의무 비율이 아닌 검토용 프리셋입니다.")
+
+    def _select_materiality_preset(self) -> None:
+        selected_label = self.materiality_preset_display_var.get()
+        for preset in MATERIALITY_PRESETS.values():
+            if preset.label == selected_label:
+                self.materiality_preset_var.set(preset.preset_id)
+                break
+        self._update_materiality_help()
 
     def log_company_entry_state(self, _event=None) -> None:
         if self.company_entry is None:
@@ -3832,7 +4035,10 @@ class DartOtApp(tk.Tk):
 
     def persist_api_key(self) -> None:
         if self.save_api_key_var.get():
-            save_config({"api_key": self.api_key_var.get().strip()})
+            save_config({
+                "api_key": self.api_key_var.get().strip(),
+                "materiality_preset": self.materiality_preset_var.get(),
+            })
         elif CONFIG_PATH.exists():
             try:
                 CONFIG_PATH.unlink()
@@ -3847,6 +4053,7 @@ class DartOtApp(tk.Tk):
             "corpCode": self.corp_code_var.get(),
             "beginYear": self.begin_year_var.get(),
             "endYear": self.end_year_var.get(),
+            "materialityPreset": self.materiality_preset_var.get(),
         }
         try:
             result = run_report(payload)
@@ -3915,7 +4122,8 @@ HTML_PAGE = r"""
     main { max-width:1120px; margin:0 auto; padding:28px; display:grid; grid-template-columns:360px 1fr; gap:22px; }
     section, aside { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:20px; }
     label { display:block; font-weight:700; margin:14px 0 7px; }
-    input { width:100%; height:40px; border:1px solid #cbd5e1; border-radius:6px; padding:0 11px; font-size:14px; }
+    input, select { width:100%; height:40px; border:1px solid #cbd5e1; border-radius:6px; padding:0 11px; font-size:14px; background:#fff; }
+    .help { margin-top:6px; font-size:12px; color:var(--muted); }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
     button { width:100%; height:44px; margin-top:18px; border:0; border-radius:6px; background:var(--accent); color:#fff; font-weight:800; cursor:pointer; }
     button:disabled { opacity:.55; cursor:wait; }
@@ -3951,6 +4159,15 @@ HTML_PAGE = r"""
           <div><label for="beginYear">시작연도</label><input id="beginYear" name="beginYear" type="number" min="1999"></div>
           <div><label for="endYear">종료연도</label><input id="endYear" name="endYear" type="number" min="1999"></div>
         </div>
+        <label for="materialityPreset">중요성 프리셋</label>
+        <select id="materialityPreset" name="materialityPreset">
+          <option value="revenue_1">매출액 1% × 25% (기본)</option>
+          <option value="revenue_05">매출액 0.5% × 25% (보수적)</option>
+          <option value="pbt_5">세전이익 5% × 25%</option>
+          <option value="assets_05">총자산 0.5% × 25%</option>
+          <option value="equity_1">자본총계 1% × 25%</option>
+        </select>
+        <p class="help">감사기준의 의무 비율이 아닌 검토용 프리셋입니다. 기업 특성과 검토 목적에 맞게 선택하세요.</p>
         <button id="run" type="submit">오버롤 테스트 실행</button>
       </form>
     </aside>
@@ -3961,7 +4178,7 @@ HTML_PAGE = r"""
       <div class="steps">
         <div class="step">1. 최근 5년치 정기보고서 목록을 수집합니다.</div>
         <div class="step">2. 차입금, 사채, 이자율 관련 주석을 필터링합니다.</div>
-        <div class="step">3. 예상 이자비용과 실제 이자비용의 차이를 PoC 검토 기준과 비교합니다.</div>
+        <div class="step">3. 예상 이자비용과 실제 이자비용의 차이를 선택한 중요성 프리셋과 비교합니다.</div>
       </div>
       <table>
         <thead><tr><th>항목</th><th>건수</th></tr></thead>

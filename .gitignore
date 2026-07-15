@@ -1,7 +1,10 @@
 bin/
 obj/
+build/
+release/
 outputs/
 .dart_ot_config.json
 .dart_corp_cache.json
 *.user
 *.suo
+*.spec

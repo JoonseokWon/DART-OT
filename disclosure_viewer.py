@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import urllib.parse
 import urllib.request
@@ -17,7 +18,13 @@ from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 
-ROOT = Path(__file__).resolve().parent
+def runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = runtime_root()
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 CORP_CACHE_PATH = ROOT / ".dart_corp_cache.json"
 DOCUMENT_PREVIEW_CHARS = 220_000
