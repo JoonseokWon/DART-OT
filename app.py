@@ -3745,7 +3745,16 @@ def configure_windows_dpi() -> None:
     if os.name != "nt":
         return
     try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        if set_context(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
     except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
@@ -3763,14 +3772,13 @@ class DartOtApp(tk.Tk):
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
-        self.tk.call("tk", "scaling", 1.35)
         self.entry_font = tkfont.Font(self, family="맑은 고딕", size=12)
         write_ui_debug(f"app_start scaling={self.tk.call('tk', 'scaling')} entry_font={self.entry_font.actual()}")
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
         self.company_var = tk.StringVar(value="삼성전자")
-        self.company_entry: tk.Entry | None = None
+        self.company_entry: ttk.Entry | None = None
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
@@ -3801,6 +3809,7 @@ class DartOtApp(tk.Tk):
         style.configure("TButton", font=("맑은 고딕", 12), padding=(8, 6))
         style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8))
         style.configure("TCheckbutton", background="#ffffff", font=("맑은 고딕", 12))
+        style.configure("Input.TEntry", font=self.entry_font, padding=(7, 6))
         style.configure("Treeview", font=("맑은 고딕", 11), rowheight=30)
         style.configure("Treeview.Heading", font=("맑은 고딕", 11, "bold"))
 
@@ -3818,25 +3827,37 @@ class DartOtApp(tk.Tk):
 
         left = ttk.Frame(body, style="Panel.TFrame", padding=20)
         left.grid(row=0, column=0, sticky="ns", padx=(0, 18))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
         right = ttk.Frame(body, style="Panel.TFrame", padding=20)
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        self._entry(left, "DART API 키", self.api_key_var, show="*")
-        ttk.Checkbutton(left, text="API 키 저장", variable=self.save_api_key_var).pack(anchor="w", pady=(0, 8))
-        self._company_entry(left)
-        self._entry(left, "종목코드", self.stock_var)
-        self._entry(left, "DART 고유번호", self.corp_code_var)
+        fields_canvas = tk.Canvas(left, background="#ffffff", borderwidth=0, highlightthickness=0, width=340)
+        fields_scrollbar = ttk.Scrollbar(left, orient="vertical", command=fields_canvas.yview)
+        fields = ttk.Frame(fields_canvas, style="Panel.TFrame")
+        fields_window = fields_canvas.create_window((0, 0), window=fields, anchor="nw")
+        fields_canvas.configure(yscrollcommand=fields_scrollbar.set)
+        fields.bind("<Configure>", lambda _event: fields_canvas.configure(scrollregion=fields_canvas.bbox("all")))
+        fields_canvas.bind("<Configure>", lambda event: fields_canvas.itemconfigure(fields_window, width=event.width))
+        fields_canvas.grid(row=0, column=0, sticky="nsew")
+        fields_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
 
-        year_frame = ttk.Frame(left, style="Panel.TFrame")
+        self._entry(fields, "DART API 키", self.api_key_var, show="*")
+        ttk.Checkbutton(fields, text="API 키 저장", variable=self.save_api_key_var).pack(anchor="w", pady=(0, 8))
+        self._company_entry(fields)
+        self._entry(fields, "종목코드", self.stock_var)
+        self._entry(fields, "DART 고유번호", self.corp_code_var)
+
+        year_frame = ttk.Frame(fields, style="Panel.TFrame")
         year_frame.pack(fill="x", pady=(4, 0))
         year_frame.columnconfigure(0, weight=1)
         year_frame.columnconfigure(1, weight=1)
         self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
         self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
 
-        preset_frame = ttk.Frame(left, style="Panel.TFrame")
+        preset_frame = ttk.Frame(fields, style="Panel.TFrame")
         preset_frame.pack(fill="x", pady=(4, 0))
         ttk.Label(preset_frame, text="중요성 프리셋", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
         preset_combo = ttk.Combobox(
@@ -3858,8 +3879,10 @@ class DartOtApp(tk.Tk):
         ).pack(anchor="w", pady=(4, 0))
         self._update_materiality_help()
 
-        ttk.Button(left, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(18, 8))
-        ttk.Button(left, text="엑셀 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
+        actions = ttk.Frame(left, style="Panel.TFrame")
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ttk.Button(actions, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions, text="결과 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
 
         ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("맑은 고딕", 14, "bold")).grid(row=0, column=0, sticky="w")
         columns = ("corp_name", "stock_code", "corp_code")
@@ -3889,38 +3912,26 @@ class DartOtApp(tk.Tk):
         else:
             container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
         ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
-        entry = tk.Entry(
+        entry = ttk.Entry(
             container,
             textvariable=variable,
             show=show or "",
             width=width or 20,
-            font=self.entry_font,
-            relief="solid",
-            bd=1,
-            highlightthickness=1,
-            highlightbackground="#cbd5e1",
-            highlightcolor="#0f766e",
-            insertwidth=1,
+            style="Input.TEntry",
         )
-        entry.pack(fill="x", ipady=5)
+        entry.pack(fill="x")
 
     def _company_entry(self, parent) -> None:
         container = ttk.Frame(parent, style="Panel.TFrame")
         container.pack(fill="x", pady=(0, 8))
         ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
-        self.company_entry = tk.Entry(
+        self.company_entry = ttk.Entry(
             container,
             textvariable=self.company_var,
             width=20,
-            font=self.entry_font,
-            relief="solid",
-            bd=1,
-            highlightthickness=1,
-            highlightbackground="#cbd5e1",
-            highlightcolor="#0f766e",
-            insertwidth=1,
+            style="Input.TEntry",
         )
-        self.company_entry.pack(fill="x", ipady=5)
+        self.company_entry.pack(fill="x")
         self.company_entry.bind("<Return>", lambda _event: self.search_company())
         self.company_entry.bind("<KeyRelease>", self.log_company_entry_state)
         self.log_company_entry_state()

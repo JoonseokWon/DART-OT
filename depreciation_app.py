@@ -434,7 +434,6 @@ class DepreciationApp(tk.Tk):
         self.title("DART-DEP")
         self.geometry("1040x680")
         self.minsize(980, 640)
-        self.tk.call("tk", "scaling", 1.35)
         self.entry_font = ("맑은 고딕", 12)
         self.selected_corp: app.CorpInfo | None = None
         self.search_results: list[app.CorpInfo] = []
@@ -465,6 +464,7 @@ class DepreciationApp(tk.Tk):
         style.configure("Title.TLabel", background="#f6f8fb", font=("맑은 고딕", 22, "bold"))
         style.configure("TButton", font=("맑은 고딕", 12), padding=(8, 6))
         style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8))
+        style.configure("Input.TEntry", font=self.entry_font, padding=(7, 6))
         style.configure("Treeview", font=("맑은 고딕", 11), rowheight=30)
         style.configure("Treeview.Heading", font=("맑은 고딕", 11, "bold"))
 
@@ -524,8 +524,8 @@ class DepreciationApp(tk.Tk):
         else:
             container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
         ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
-        entry = tk.Entry(container, textvariable=variable, show=show or "", width=width or 20, font=self.entry_font, relief="solid", bd=1, highlightthickness=1, highlightbackground="#cbd5e1", highlightcolor="#0f766e", insertwidth=1)
-        entry.pack(fill="x", ipady=5)
+        entry = ttk.Entry(container, textvariable=variable, show=show or "", width=width or 20, style="Input.TEntry")
+        entry.pack(fill="x")
         if label == "회사명":
             entry.bind("<Return>", lambda _event: self.search_company())
 
