@@ -43,11 +43,21 @@ $Targets = @(
 )
 
 foreach ($Target in $Targets) {
+    $BrandArgs = @()
+    if ($Target.Name -eq "DART-OT") {
+        $IconPath = Join-Path $Root "assets\DART-OT.ico"
+        $PngPath = Join-Path $Root "assets\DART-OT.png"
+        if (-not (Test-Path -LiteralPath $IconPath) -or -not (Test-Path -LiteralPath $PngPath)) {
+            throw "Missing DART-OT brand assets. Run scripts/build_icon.py first."
+        }
+        $BrandArgs = @("--icon", $IconPath, "--add-data", "$PngPath;assets")
+    }
     & $Python -m PyInstaller `
         --noconfirm `
         --clean `
         --onefile `
         --windowed `
+        @BrandArgs `
         --name $Target.Name `
         --distpath $DistRoot `
         --workpath (Join-Path $WorkRoot $Target.Name) `

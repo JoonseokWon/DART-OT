@@ -430,6 +430,9 @@ class DepHandler(BaseHTTPRequestHandler):
 class DepreciationApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        dpi = max(96.0, float(self.winfo_fpixels("1i")))
+        self.ui_scale = min(2.0, max(1.0, dpi / 96.0))
+        self.tk.call("tk", "scaling", dpi / 72.0)
         self.config_data = app.load_config()
         self.title("DART-DEP")
         self.geometry("1040x680")
@@ -438,6 +441,7 @@ class DepreciationApp(tk.Tk):
         self.selected_corp: app.CorpInfo | None = None
         self.search_results: list[app.CorpInfo] = []
         self.output_file: Path | None = None
+        self.native_entries: list[app.NativeWindowsEntry] = []
 
         self.api_key_var = tk.StringVar(value=self.config_data.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config_data.get("api_key", "")))
@@ -524,12 +528,18 @@ class DepreciationApp(tk.Tk):
         else:
             container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
         ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        if os.name == "nt":
+            entry = app.NativeWindowsEntry(container, variable, self.ui_scale, show=show)
+            self.native_entries.append(entry)
+            return
         entry = ttk.Entry(container, textvariable=variable, show=show or "", width=width or 20, style="Input.TEntry")
         entry.pack(fill="x")
         if label == "회사명":
             entry.bind("<Return>", lambda _event: self.search_company())
 
     def search_company(self) -> None:
+        for entry in self.native_entries:
+            entry.sync()
         api_key = self.api_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
@@ -566,6 +576,8 @@ class DepreciationApp(tk.Tk):
         self.corp_code_var.set(self.selected_corp.corp_code)
 
     def run_export(self) -> None:
+        for entry in self.native_entries:
+            entry.sync()
         api_key = self.api_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")

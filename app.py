@@ -1,5 +1,6 @@
 import html
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import calendar
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -32,9 +34,21 @@ def runtime_root() -> Path:
 
 
 ROOT = runtime_root()
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 UI_DEBUG_PATH = OUTPUT_DIR / "ui_debug.log"
+SOURCE_RELOAD_INTERVAL_MS = 800
+OT_DARK = "#052D2B"
+OT_DARK_2 = "#0A4440"
+OT_ACCENT = "#16A58F"
+OT_MINT = "#5EEAD4"
+OT_PALE = "#E8F7F4"
+OT_BG = "#F2F7F6"
+OT_INK = "#15312E"
+OT_MUTED = "#647976"
+OT_LINE = "#CFE0DD"
+OT_WHITE = "#FFFFFF"
 BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공", "이자비용", "금융원가"]
 DISPLAY_KEYWORDS = [
     "전환사채",
@@ -103,6 +117,13 @@ class BorrowingLine:
     source_file: str
     line_no: int
     context: str
+
+
+@dataclass
+class StyledWorkbookRow:
+    values: list
+    style_id: int = 0
+    cell_styles: dict[int, int] | None = None
 
 
 @dataclass
@@ -477,12 +498,18 @@ class DartClient:
             return response.read()
 
 
-def run_report(payload: dict) -> dict:
+def run_report(payload: dict, progress_callback=None) -> dict:
+    def report_progress(percent: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(percent, message)
+
+    report_progress(3, "입력 조건을 확인하고 있습니다")
     api_key = payload.get("apiKey", "").strip()
     if not api_key:
         return fail("DART API 키를 입력해 주세요.")
 
     client = DartClient(api_key)
+    report_progress(8, "회사 정보를 확인하고 있습니다")
     corp = client.resolve_corp(
         payload.get("corpCode", ""),
         payload.get("stockCode", ""),
@@ -498,7 +525,9 @@ def run_report(payload: dict) -> dict:
     if materiality_preset_id not in MATERIALITY_PRESETS:
         return fail("알 수 없는 중요성 프리셋입니다. 화면에서 기준을 다시 선택해 주세요.")
 
+    report_progress(14, "정기보고서 목록을 조회하고 있습니다")
     reports = client.get_reports(corp.corp_code, begin_year, end_year)
+    report_progress(22, f"정기보고서 {len(reports)}건을 확인했습니다")
     borrowing_lines: list[BorrowingLine] = []
     financial_benchmarks: dict[str, FinancialBenchmarks] = {}
     issues: list[ExtractionIssue] = []
@@ -527,6 +556,7 @@ def run_report(payload: dict) -> dict:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {executor.submit(process_report, report): report for report in reports}
         processed: dict[str, tuple[list[BorrowingLine], FinancialBenchmarks, list[ExtractionIssue]]] = {}
+        completed_reports = 0
         for future in as_completed(future_map):
             try:
                 report, report_lines, benchmarks, report_issues = future.result()
@@ -536,6 +566,9 @@ def run_report(payload: dict) -> dict:
                 benchmarks = FinancialBenchmarks()
                 report_issues = [extraction_issue(report, "report_worker", exc)]
             processed[report.receipt_no] = (report_lines, benchmarks, report_issues)
+            completed_reports += 1
+            extraction_percent = 22 + round(48 * completed_reports / max(1, len(reports)))
+            report_progress(extraction_percent, f"공시와 주석을 분석하고 있습니다 ({completed_reports}/{len(reports)})")
 
     for report in reports:
         report_lines, benchmarks, report_issues = processed.get(report.receipt_no, ([], FinancialBenchmarks(), []))
@@ -543,10 +576,29 @@ def run_report(payload: dict) -> dict:
         financial_benchmarks[report.receipt_no] = benchmarks
         issues.extend(report_issues)
 
+    report_progress(76, "연도별 이자비용 오버롤 테스트를 계산하고 있습니다")
     tests = build_overall_tests(reports, borrowing_lines, financial_benchmarks, materiality_preset_id)
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    report_progress(88, "검토 결과 엑셀 파일을 생성하고 있습니다")
     save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests, issues)
+
+    judgment_counts = Counter(str(row.get("judgment") or "미분류") for row in tests)
+    test_summaries = [
+        {
+            "reportName": row.get("report_name", ""),
+            "receiptDate": row.get("receipt_date", ""),
+            "judgment": row.get("judgment", ""),
+            "expectedInterest": row.get("expected_interest_expense"),
+            "actualInterest": row.get("actual_interest_expense"),
+            "difference": row.get("interest_expense_diff"),
+            "threshold": row.get("materiality_threshold"),
+            "caution": row.get("caution_status", ""),
+            "cautionReason": row.get("caution_reason", ""),
+        }
+        for row in tests
+    ]
+    report_progress(100, "검토 결과 생성을 완료했습니다")
 
     return {
         "ok": True,
@@ -558,6 +610,11 @@ def run_report(payload: dict) -> dict:
         "issueCount": len(issues),
         "materialityPreset": materiality_preset_id,
         "materialityPresetLabel": MATERIALITY_PRESETS[materiality_preset_id].label,
+        "companyName": corp.corp_name,
+        "beginYear": begin_year,
+        "endYear": end_year,
+        "judgmentCounts": dict(judgment_counts),
+        "testSummaries": test_summaries,
     }
 
 
@@ -3482,6 +3539,76 @@ def save_workbook(
             note_reference(line),
         ]
 
+    detail_rows_by_report: dict[str, list[list]] = {}
+    total_lines_by_report: dict[str, list[BorrowingLine]] = {}
+    for line in borrowing_filter_lines:
+        detail_rows_by_report.setdefault(line.receipt_no, []).append(filter_row(line))
+    for line in financial_statement_lines:
+        total_lines_by_report.setdefault(line.receipt_no, []).append(line)
+
+    report_order = [report.receipt_no for report in reports]
+    for line in borrowing_filter_lines + financial_statement_lines + interest_expense_lines:
+        if line.receipt_no not in report_order:
+            report_order.append(line.receipt_no)
+
+    borrowing_filter_rows: list[list | StyledWorkbookRow] = []
+    for receipt_no in report_order:
+        borrowing_filter_rows.extend(detail_rows_by_report.get(receipt_no, []))
+        period_totals = total_lines_by_report.get(receipt_no, [])
+        if not period_totals:
+            continue
+        representative = period_totals[0]
+        total_amount = sum(line.max_amount for line in period_totals)
+        borrowing_filter_rows.append(
+            StyledWorkbookRow(
+                [
+                    representative.corp_name,
+                    representative.report_name,
+                    "참고 합계",
+                    "재무상태표 API",
+                    "",
+                    "",
+                    "백만원",
+                    total_amount,
+                    "표시 전용·검증 계산 제외 | DART 재무제표 API에서 집계한 보고기간 말 차입 잔액 합계",
+                ],
+                style_id=4,
+                cell_styles={8: 5},
+            )
+        )
+
+    interest_rows_by_report: dict[str, list[BorrowingLine]] = {}
+    for line in interest_expense_lines:
+        interest_rows_by_report.setdefault(line.receipt_no, []).append(line)
+
+    interest_expense_rows: list[list | StyledWorkbookRow] = []
+    for receipt_no in report_order:
+        report_interest_lines = interest_rows_by_report.get(receipt_no, [])
+        interest_expense_rows.extend(filter_row(line) for line in report_interest_lines)
+        if not report_interest_lines:
+            continue
+        selected_expense = extract_note_interest_expense(report_interest_lines)
+        if selected_expense is None or selected_expense.actual_interest_expense is None:
+            continue
+        representative = report_interest_lines[0]
+        interest_expense_rows.append(
+            StyledWorkbookRow(
+                [
+                    representative.corp_name,
+                    representative.report_name,
+                    "참고 합계",
+                    "금융비용 주석",
+                    "",
+                    "",
+                    "백만원",
+                    selected_expense.actual_interest_expense,
+                    f"표시 전용·검증 계산 제외 | {selected_expense.memo}",
+                ],
+                style_id=4,
+                cell_styles={8: 5},
+            )
+        )
+
     sheets = [
         (
             "정기보고서목록",
@@ -3492,19 +3619,13 @@ def save_workbook(
         (
             "차입금필터링",
             filter_headers,
-            [filter_row(line) for line in borrowing_filter_lines],
-            {8: 2},
-        ),
-        (
-            "재무상태표차입잔액",
-            filter_headers,
-            [filter_row(line) for line in financial_statement_lines],
+            borrowing_filter_rows,
             {8: 2},
         ),
         (
             "이자비용필터링",
             filter_headers,
-            [filter_row(line) for line in interest_expense_lines],
+            interest_expense_rows,
             {8: 2},
         ),
         (
@@ -3515,10 +3636,6 @@ def save_workbook(
                 "판정",
                 "판정근거",
                 "중요성프리셋",
-                "기준항목",
-                "기준금액",
-                "중요성비율",
-                "테스트적용률",
                 "허용차이",
                 "예상이자비용",
                 "실제이자비용",
@@ -3545,10 +3662,6 @@ def save_workbook(
                     t["judgment"],
                     t["judgment_basis"],
                     t["materiality_preset"],
-                    t["materiality_benchmark"],
-                    t["materiality_benchmark_amount"],
-                    t["materiality_benchmark_rate"],
-                    t["materiality_test_fraction"],
                     t["materiality_threshold"],
                     t["expected_interest_expense"],
                     t["actual_interest_expense"],
@@ -3570,7 +3683,7 @@ def save_workbook(
                 ]
                 for t in tests
             ],
-            {7: 2, 8: 3, 9: 3, 10: 2, 11: 2, 12: 2, 13: 2, 15: 2, 16: 3, 17: 3, 18: 3, 19: 2, 20: 2, 22: 3, 23: 2},
+            {6: 2, 7: 2, 8: 2, 9: 2, 11: 2, 12: 3, 13: 3, 14: 3, 15: 2, 16: 2, 18: 3, 19: 2},
         ),
     ]
     sheets.append(
@@ -3592,7 +3705,11 @@ def save_workbook(
             archive.writestr(f"xl/worksheets/sheet{index}.xml", sheet_xml(headers, rows, column_styles))
 
 
-def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int, int] | None = None) -> str:
+def sheet_xml(
+    headers: list[str],
+    rows: list[list | StyledWorkbookRow],
+    column_styles: dict[int, int] | None = None,
+) -> str:
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
     widths = [16, 28, 12, 16, 14, 18, 14, 18, 16, 16, 16, 12, 16, 16, 16, 16, 16, 16, 16, 16, 14, 16, 34, 12, 80]
@@ -3603,16 +3720,36 @@ def sheet_xml(headers: list[str], rows: list[list[str]], column_styles: dict[int
     lines.append(f'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>{cols}</cols><sheetData>')
     lines.append(row_xml(1, headers, True, column_styles))
     for idx, row in enumerate(rows, start=2):
-        lines.append(row_xml(idx, row, False, column_styles))
+        if isinstance(row, StyledWorkbookRow):
+            lines.append(
+                row_xml(
+                    idx,
+                    row.values,
+                    False,
+                    column_styles,
+                    row_style=row.style_id,
+                    cell_styles=row.cell_styles,
+                )
+            )
+        else:
+            lines.append(row_xml(idx, row, False, column_styles))
     lines.append("</sheetData></worksheet>")
     return "".join(lines)
 
 
-def row_xml(row_no: int, values: list[str], header: bool, column_styles: dict[int, int]) -> str:
+def row_xml(
+    row_no: int,
+    values: list,
+    header: bool,
+    column_styles: dict[int, int],
+    row_style: int = 0,
+    cell_styles: dict[int, int] | None = None,
+) -> str:
+    cell_styles = cell_styles or {}
     cells = []
     for idx, value in enumerate(values, start=1):
         ref = f"{column_name(idx)}{row_no}"
-        style_id = 1 if header else column_styles.get(idx, 0)
+        style_id = 1 if header else cell_styles.get(idx, row_style or column_styles.get(idx, 0))
         style = f' s="{style_id}"' if style_id else ""
         if not header and isinstance(value, (int, float)) and value is not None:
             cells.append(f'<c r="{ref}"{style}><v>{value}</v></c>')
@@ -3665,7 +3802,7 @@ def workbook_xml(names: list[str]) -> str:
 
 
 def styles_xml() -> str:
-    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0"/><numFmt numFmtId="165" formatCode="0.00%"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>"""
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0"/><numFmt numFmtId="165" formatCode="0.00%"/></numFmts><fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FF1B5E20"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9EAD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="2" fillId="1" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="2" fillId="1" borderId="0" xfId="0" applyFont="1" applyFill="1" applyNumberFormat="1"/></cellXfs></styleSheet>"""
 
 
 def money(value: float | None) -> str:
@@ -3748,7 +3885,9 @@ def configure_windows_dpi() -> None:
         set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
         set_context.argtypes = [ctypes.c_void_p]
         set_context.restype = ctypes.c_bool
-        if set_context(ctypes.c_void_p(-4)):
+        # Tk 8.6 can misplace Korean IME composition text with Per-Monitor V2.
+        # System DPI awareness keeps the native input method coordinates aligned.
+        if set_context(ctypes.c_void_p(-2)):
             return
     except Exception:
         pass
@@ -3762,23 +3901,209 @@ def configure_windows_dpi() -> None:
             pass
 
 
+class NativeWindowsEntry:
+    """Native Windows EDIT control embedded in Tk for reliable Korean IME input."""
+
+    WS_CHILD = 0x40000000
+    WS_VISIBLE = 0x10000000
+    WS_TABSTOP = 0x00010000
+    WS_BORDER = 0x00800000
+    ES_AUTOHSCROLL = 0x0080
+    EM_SETPASSWORDCHAR = 0x00CC
+    WM_SETFONT = 0x0030
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        variable: tk.StringVar,
+        scale: float,
+        *,
+        show: str | None = None,
+        on_change=None,
+    ) -> None:
+        self.variable = variable
+        self.on_change = on_change
+        self._destroyed = False
+        self._last_value = variable.get()
+        self.container = tk.Frame(parent, background="#ffffff", height=max(30, round(30 * scale)))
+        self.container.pack(fill="x")
+        self.container.pack_propagate(False)
+        self.container.update_idletasks()
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        gdi32 = ctypes.windll.gdi32
+        user32.CreateWindowExW.argtypes = (
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        )
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.SetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
+        user32.SetWindowTextW.restype = wintypes.BOOL
+        user32.MoveWindow.argtypes = (
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.BOOL,
+        )
+        user32.IsWindow.argtypes = (wintypes.HWND,)
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.DestroyWindow.argtypes = (wintypes.HWND,)
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.SendMessageW.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.SendMessageW.restype = wintypes.LPARAM
+        kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        gdi32.CreateFontW.restype = wintypes.HFONT
+        gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+        gdi32.DeleteObject.restype = wintypes.BOOL
+
+        styles = self.WS_CHILD | self.WS_VISIBLE | self.WS_TABSTOP | self.WS_BORDER | self.ES_AUTOHSCROLL
+        self.hwnd = user32.CreateWindowExW(
+            0,
+            "EDIT",
+            variable.get(),
+            styles,
+            0,
+            0,
+            max(1, self.container.winfo_width()),
+            max(1, self.container.winfo_height()),
+            self.container.winfo_id(),
+            None,
+            kernel32.GetModuleHandleW(None),
+            None,
+        )
+        if not self.hwnd:
+            raise ctypes.WinError()
+
+        font_height = -max(15, round(14 * scale))
+        self.font_handle = gdi32.CreateFontW(
+            font_height,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            "Malgun Gothic",
+        )
+        if self.font_handle:
+            user32.SendMessageW(self.hwnd, self.WM_SETFONT, self.font_handle, 1)
+        if show:
+            user32.SendMessageW(self.hwnd, self.EM_SETPASSWORDCHAR, ord(show[0]), 0)
+
+        self.container.bind("<Configure>", self._resize, add="+")
+        self.container.bind("<Destroy>", self._destroy, add="+")
+        self.container.after(80, self._poll)
+
+    def _resize(self, _event: tk.Event | None = None) -> None:
+        if self._destroyed or not ctypes.windll.user32.IsWindow(self.hwnd):
+            return
+        ctypes.windll.user32.MoveWindow(
+            self.hwnd,
+            0,
+            0,
+            max(1, self.container.winfo_width()),
+            max(1, self.container.winfo_height()),
+            True,
+        )
+
+    def _control_value(self) -> str:
+        if self._destroyed or not ctypes.windll.user32.IsWindow(self.hwnd):
+            return self.variable.get()
+        length = ctypes.windll.user32.GetWindowTextLengthW(self.hwnd)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(self.hwnd, buffer, length + 1)
+        return buffer.value
+
+    def sync(self) -> str:
+        control_value = self._control_value()
+        variable_value = self.variable.get()
+        if control_value != self._last_value:
+            self._last_value = control_value
+            if variable_value != control_value:
+                self.variable.set(control_value)
+            if self.on_change is not None:
+                self.on_change()
+        elif variable_value != self._last_value:
+            ctypes.windll.user32.SetWindowTextW(self.hwnd, variable_value)
+            self._last_value = variable_value
+        return self._last_value
+
+    def _poll(self) -> None:
+        if self._destroyed:
+            return
+        self.sync()
+        self.container.after(80, self._poll)
+
+    def winfo_class(self) -> str:
+        return "Edit"
+
+    def winfo_height(self) -> int:
+        return self.container.winfo_height()
+
+    def tk_focusNext(self):
+        return self.container.tk_focusNext()
+
+    def _destroy(self, event: tk.Event) -> None:
+        if event.widget is not self.container or self._destroyed:
+            return
+        self._destroyed = True
+        if ctypes.windll.user32.IsWindow(self.hwnd):
+            ctypes.windll.user32.DestroyWindow(self.hwnd)
+        if self.font_handle:
+            ctypes.windll.gdi32.DeleteObject(self.font_handle)
+
+
 class DartOtApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        dpi = max(96.0, float(self.winfo_fpixels("1i")))
+        self.ui_scale = min(2.0, max(1.0, dpi / 96.0))
+        self.tk.call("tk", "scaling", dpi / 72.0)
         self.config = load_config()
         self.title("DART-OT")
+        self._set_icon()
         self.geometry("1280x820")
         self.minsize(1180, 760)
         self.selected_corp: CorpInfo | None = None
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
+        self.native_entries: list[NativeWindowsEntry] = []
         self.entry_font = tkfont.Font(self, family="맑은 고딕", size=12)
         write_ui_debug(f"app_start scaling={self.tk.call('tk', 'scaling')} entry_font={self.entry_font.actual()}")
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
         self.company_var = tk.StringVar(value="삼성전자")
-        self.company_entry: ttk.Entry | None = None
+        self.company_entry: NativeWindowsEntry | ttk.Entry | None = None
         self.stock_var = tk.StringVar()
         self.corp_code_var = tk.StringVar()
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
@@ -3792,34 +4117,86 @@ class DartOtApp(tk.Tk):
         self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
 
         self._build()
+        self._enable_source_reload()
+
+    def _set_icon(self) -> None:
+        icon_path = BUNDLE_ROOT / "assets" / "DART-OT.png"
+        if not icon_path.exists():
+            return
+        try:
+            self._icon_image = tk.PhotoImage(file=icon_path)
+            self.iconphoto(True, self._icon_image)
+        except tk.TclError:
+            pass
 
     def _build(self) -> None:
-        self.configure(bg="#f6f8fb")
+        self.configure(bg=OT_BG)
         for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
             try:
                 tkfont.nametofont(font_name).configure(family="맑은 고딕", size=12)
             except tk.TclError:
                 pass
         style = ttk.Style(self)
-        style.configure("TFrame", background="#f6f8fb")
-        style.configure("Panel.TFrame", background="#ffffff")
-        style.configure("TLabel", background="#f6f8fb", font=("맑은 고딕", 12))
-        style.configure("Panel.TLabel", background="#ffffff", font=("맑은 고딕", 12))
-        style.configure("Title.TLabel", background="#f6f8fb", font=("맑은 고딕", 22, "bold"))
+        style.configure("TFrame", background=OT_BG)
+        style.configure("Panel.TFrame", background=OT_WHITE)
+        style.configure("API.TFrame", background=OT_DARK_2)
+        style.configure("TLabel", background=OT_BG, foreground=OT_INK, font=("맑은 고딕", 12))
+        style.configure("Panel.TLabel", background=OT_WHITE, foreground=OT_INK, font=("맑은 고딕", 12))
+        style.configure("API.TLabel", background=OT_DARK_2, foreground="#D8EFEB", font=("맑은 고딕", 12))
+        style.configure("Title.TLabel", background=OT_DARK, foreground=OT_WHITE, font=("맑은 고딕", 22, "bold"))
         style.configure("TButton", font=("맑은 고딕", 12), padding=(8, 6))
-        style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8))
-        style.configure("TCheckbutton", background="#ffffff", font=("맑은 고딕", 12))
-        style.configure("Input.TEntry", font=self.entry_font, padding=(7, 6))
+        style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8), foreground=OT_DARK)
+        style.configure("TCheckbutton", background=OT_WHITE, font=("맑은 고딕", 12))
+        style.configure("API.TCheckbutton", background=OT_DARK_2, foreground="#D8EFEB", font=("맑은 고딕", 12))
+        style.map(
+            "API.TCheckbutton",
+            background=[("active", OT_DARK_2)],
+            foreground=[("active", OT_WHITE), ("disabled", "#779C97")],
+        )
+        style.configure("Input.TEntry", font=self.entry_font, padding=(6, 4))
+        style.configure("TCombobox", font=("맑은 고딕", 11), padding=(5, 3))
         style.configure("Treeview", font=("맑은 고딕", 11), rowheight=30)
         style.configure("Treeview.Heading", font=("맑은 고딕", 11, "bold"))
+        style.configure("OT.Horizontal.TProgressbar", troughcolor=OT_PALE, background=OT_ACCENT, bordercolor=OT_PALE, thickness=10)
 
-        root = ttk.Frame(self, padding=24)
+        root = tk.Frame(self, bg=OT_BG)
         root.pack(fill="both", expand=True)
 
-        ttk.Label(root, text="DART-OT", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(root, text="DART 공시 기반 차입금 필터링 및 이자율 오버롤 테스트 파일 생성 도구").pack(anchor="w", pady=(4, 20))
+        header = tk.Frame(root, bg=OT_DARK, padx=26, pady=15)
+        header.pack(fill="x")
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, minsize=390)
 
-        body = ttk.Frame(root)
+        title_block = tk.Frame(header, bg=OT_DARK)
+        title_block.grid(row=0, column=0, sticky="nw", padx=(0, 24))
+        brand_line = tk.Frame(title_block, bg=OT_DARK)
+        brand_line.pack(anchor="w")
+        logo = tk.Frame(brand_line, bg=OT_DARK_2, width=58, height=58, highlightbackground=OT_MINT, highlightthickness=2)
+        logo.pack(side="left", padx=(0, 14))
+        logo.pack_propagate(False)
+        tk.Label(logo, text="DO", bg=OT_DARK_2, fg=OT_MINT, font=("Segoe UI", 19, "bold")).pack(expand=True)
+        brand_text = tk.Frame(brand_line, bg=OT_DARK)
+        brand_text.pack(side="left")
+        ttk.Label(brand_text, text="DART-OT", style="Title.TLabel").pack(anchor="w")
+        tk.Label(brand_text, text="이자비용 오버롤 테스트", bg=OT_DARK, fg="#C9E6E1", font=("맑은 고딕", 10)).pack(anchor="w")
+        tk.Label(title_block, text="DART 공시에서 차입금·이자율·실제 이자비용을 연결해 검토합니다.", bg=OT_DARK, fg="#A9CAC5", font=("맑은 고딕", 9)).pack(anchor="w", pady=(6, 0))
+
+        api_panel = ttk.Frame(header, style="API.TFrame", padding=(14, 8))
+        api_panel.grid(row=0, column=1, sticky="new")
+        self._entry(api_panel, "DART API 키", self.api_key_var, show="*", surface="API")
+        ttk.Checkbutton(
+            api_panel,
+            text="API 키 저장",
+            variable=self.save_api_key_var,
+            style="API.TCheckbutton",
+        ).pack(anchor="w")
+
+        content = tk.Frame(root, bg=OT_BG, padx=22, pady=18)
+        content.pack(fill="both", expand=True)
+        self.setup_page = ttk.Frame(content)
+        self.setup_page.pack(fill="both", expand=True)
+
+        body = ttk.Frame(self.setup_page)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=0)
         body.columnconfigure(1, weight=1)
@@ -3834,32 +4211,22 @@ class DartOtApp(tk.Tk):
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        fields_canvas = tk.Canvas(left, background="#ffffff", borderwidth=0, highlightthickness=0, width=340)
-        fields_scrollbar = ttk.Scrollbar(left, orient="vertical", command=fields_canvas.yview)
-        fields = ttk.Frame(fields_canvas, style="Panel.TFrame")
-        fields_window = fields_canvas.create_window((0, 0), window=fields, anchor="nw")
-        fields_canvas.configure(yscrollcommand=fields_scrollbar.set)
-        fields.bind("<Configure>", lambda _event: fields_canvas.configure(scrollregion=fields_canvas.bbox("all")))
-        fields_canvas.bind("<Configure>", lambda event: fields_canvas.itemconfigure(fields_window, width=event.width))
-        fields_canvas.grid(row=0, column=0, sticky="nsew")
-        fields_scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
-
-        self._entry(fields, "DART API 키", self.api_key_var, show="*")
-        ttk.Checkbutton(fields, text="API 키 저장", variable=self.save_api_key_var).pack(anchor="w", pady=(0, 8))
+        fields = ttk.Frame(left, style="Panel.TFrame", width=340)
+        fields.grid(row=0, column=0, sticky="new")
         self._company_entry(fields)
         self._entry(fields, "종목코드", self.stock_var)
         self._entry(fields, "DART 고유번호", self.corp_code_var)
 
         year_frame = ttk.Frame(fields, style="Panel.TFrame")
-        year_frame.pack(fill="x", pady=(4, 0))
+        year_frame.pack(fill="x", pady=(2, 0))
         year_frame.columnconfigure(0, weight=1)
         year_frame.columnconfigure(1, weight=1)
         self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
         self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
 
         preset_frame = ttk.Frame(fields, style="Panel.TFrame")
-        preset_frame.pack(fill="x", pady=(4, 0))
-        ttk.Label(preset_frame, text="중요성 프리셋", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        preset_frame.pack(fill="x", pady=(2, 0))
+        ttk.Label(preset_frame, text="중요성 프리셋", style="Panel.TLabel").pack(anchor="w", pady=(0, 2))
         preset_combo = ttk.Combobox(
             preset_frame,
             state="readonly",
@@ -3869,20 +4236,13 @@ class DartOtApp(tk.Tk):
         )
         preset_combo.pack(fill="x")
         preset_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_materiality_preset())
-        self.materiality_help_var = tk.StringVar()
-        ttk.Label(
-            preset_frame,
-            textvariable=self.materiality_help_var,
-            style="Panel.TLabel",
-            wraplength=300,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 0))
-        self._update_materiality_help()
 
         actions = ttk.Frame(left, style="Panel.TFrame")
-        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        ttk.Button(actions, text="회사 검색", command=self.search_company, style="Accent.TButton").pack(fill="x", pady=(0, 8))
-        ttk.Button(actions, text="결과 파일 생성", command=self.run_export, style="Accent.TButton").pack(fill="x")
+        actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.search_button = ttk.Button(actions, text="회사 검색", command=self.search_company, style="Accent.TButton")
+        self.search_button.pack(fill="x", pady=(0, 8))
+        self.export_button = ttk.Button(actions, text="검토 실행 및 결과 생성", command=self.run_export, style="Accent.TButton")
+        self.export_button.pack(fill="x")
 
         ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("맑은 고딕", 14, "bold")).grid(row=0, column=0, sticky="w")
         columns = ("corp_name", "stock_code", "corp_code")
@@ -3904,14 +4264,89 @@ class DartOtApp(tk.Tk):
         buttons.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         ttk.Button(buttons, text="결과 파일 열기", command=self.open_output).pack(side="left")
         ttk.Button(buttons, text="저장 폴더 열기", command=self.open_output_dir).pack(side="left", padx=(8, 0))
+        self._build_result_page(content)
 
-    def _entry(self, parent, label: str, variable: tk.StringVar, show: str | None = None, width: int | None = None, grid_col: int | None = None) -> None:
-        container = ttk.Frame(parent, style="Panel.TFrame")
+    def _build_result_page(self, parent: tk.Widget) -> None:
+        self.result_page = tk.Frame(parent, bg=OT_BG)
+        top = tk.Frame(self.result_page, bg=OT_BG)
+        top.pack(fill="x", pady=(0, 12))
+        self.result_back_button = tk.Button(
+            top, text="← 조건 및 회사 선택", command=self._show_setup_page,
+            bg=OT_PALE, fg=OT_DARK, relief="flat", font=("맑은 고딕", 10, "bold"), padx=14, pady=7,
+        )
+        self.result_back_button.pack(side="left")
+        self.result_title_var = tk.StringVar(value="검토 결과")
+        tk.Label(top, textvariable=self.result_title_var, bg=OT_BG, fg=OT_DARK, font=("맑은 고딕", 19, "bold")).pack(side="left", padx=18)
+
+        status_card = tk.Frame(self.result_page, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=18, pady=13)
+        status_card.pack(fill="x", pady=(0, 12))
+        self.result_status_var = tk.StringVar(value="검토를 준비하고 있습니다.")
+        tk.Label(status_card, textvariable=self.result_status_var, bg=OT_WHITE, fg=OT_ACCENT, font=("맑은 고딕", 10, "bold"), anchor="w").pack(fill="x")
+        self.result_progress = ttk.Progressbar(status_card, style="OT.Horizontal.TProgressbar", mode="determinate", maximum=100, value=0)
+        self.result_progress.pack(fill="x", pady=(9, 0))
+
+        metrics = tk.Frame(self.result_page, bg=OT_BG)
+        metrics.pack(fill="x", pady=(0, 12))
+        self.result_metric_vars: dict[str, tk.StringVar] = {}
+        for column, (key, label) in enumerate((("reports", "정기보고서"), ("tests", "연도별 테스트"), ("within", "기준 이내"), ("review", "추가 확인"), ("issues", "추출 이슈"))):
+            metrics.grid_columnconfigure(column, weight=1, uniform="metric")
+            card = tk.Frame(metrics, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=13, pady=10)
+            card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 5, 0 if column == 4 else 5))
+            value_var = tk.StringVar(value="-")
+            self.result_metric_vars[key] = value_var
+            tk.Label(card, text=label, bg=OT_WHITE, fg=OT_MUTED, font=("맑은 고딕", 9)).pack(anchor="w")
+            tk.Label(card, textvariable=value_var, bg=OT_WHITE, fg=OT_DARK, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+
+        detail = tk.Frame(self.result_page, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=16, pady=14)
+        detail.pack(fill="both", expand=True)
+        detail.grid_columnconfigure(0, weight=1)
+        detail.grid_rowconfigure(2, weight=1)
+        self.result_summary_var = tk.StringVar(value="분석을 실행하면 회사와 적용 기준 요약이 표시됩니다.")
+        tk.Label(detail, text="즉시 확인 요약", bg=OT_WHITE, fg=OT_DARK, font=("맑은 고딕", 13, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(detail, textvariable=self.result_summary_var, bg=OT_WHITE, fg=OT_INK, font=("맑은 고딕", 10), anchor="w", justify="left", wraplength=1050).grid(row=1, column=0, sticky="ew", pady=(5, 12))
+        columns = ("report", "judgment", "expected", "actual", "difference", "threshold", "caution")
+        self.result_tree = ttk.Treeview(detail, columns=columns, show="headings", height=8)
+        for key, label, width in (("report", "보고서", 250), ("judgment", "판정", 115), ("expected", "계산 이자", 120), ("actual", "실제 이자", 120), ("difference", "차이", 110), ("threshold", "허용차이", 110), ("caution", "주의", 90)):
+            self.result_tree.heading(key, text=label)
+            self.result_tree.column(key, width=width, anchor="center" if key != "report" else "w")
+        self.result_tree.tag_configure("review", background="#FFF1E8", foreground="#8A3B12")
+        self.result_tree.tag_configure("within", background="#ECF9F5", foreground="#0B6658")
+        self.result_tree.grid(row=2, column=0, sticky="nsew")
+
+        result_actions = tk.Frame(self.result_page, bg=OT_BG)
+        result_actions.pack(fill="x", pady=(12, 0))
+        self.result_open_button = tk.Button(result_actions, text="결과 엑셀 열기", command=self.open_output, state="disabled", bg=OT_ACCENT, fg=OT_WHITE, disabledforeground="#B7C7C4", relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9)
+        self.result_open_button.pack(side="left")
+        tk.Button(result_actions, text="저장 폴더 열기", command=self.open_output_dir, bg=OT_PALE, fg=OT_DARK, relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9).pack(side="left", padx=8)
+
+    def _show_result_page(self) -> None:
+        self.setup_page.pack_forget()
+        self.result_page.pack(fill="both", expand=True)
+
+    def _show_setup_page(self) -> None:
+        self.result_page.pack_forget()
+        self.setup_page.pack(fill="both", expand=True)
+
+    def _entry(
+        self,
+        parent,
+        label: str,
+        variable: tk.StringVar,
+        show: str | None = None,
+        width: int | None = None,
+        grid_col: int | None = None,
+        surface: str = "Panel",
+    ) -> None:
+        container = ttk.Frame(parent, style=f"{surface}.TFrame")
         if grid_col is None:
-            container.pack(fill="x", pady=(0, 8))
+            container.pack(fill="x", pady=(0, 6))
         else:
             container.grid(row=0, column=grid_col, sticky="ew", padx=(0 if grid_col == 0 else 6, 6 if grid_col == 0 else 0))
-        ttk.Label(container, text=label, style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(container, text=label, style=f"{surface}.TLabel").pack(anchor="w", pady=(0, 2))
+        if sys.platform == "win32":
+            entry = NativeWindowsEntry(container, variable, self.ui_scale, show=show)
+            self.native_entries.append(entry)
+            return
         entry = ttk.Entry(
             container,
             textvariable=variable,
@@ -3923,8 +4358,18 @@ class DartOtApp(tk.Tk):
 
     def _company_entry(self, parent) -> None:
         container = ttk.Frame(parent, style="Panel.TFrame")
-        container.pack(fill="x", pady=(0, 8))
-        ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 4))
+        container.pack(fill="x", pady=(0, 6))
+        ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 2))
+        if sys.platform == "win32":
+            self.company_entry = NativeWindowsEntry(
+                container,
+                self.company_var,
+                self.ui_scale,
+                on_change=self.log_company_entry_state,
+            )
+            self.native_entries.append(self.company_entry)
+            self.log_company_entry_state()
+            return
         self.company_entry = ttk.Entry(
             container,
             textvariable=self.company_var,
@@ -3936,20 +4381,74 @@ class DartOtApp(tk.Tk):
         self.company_entry.bind("<KeyRelease>", self.log_company_entry_state)
         self.log_company_entry_state()
 
-    def _update_materiality_help(self) -> None:
-        preset = MATERIALITY_PRESETS.get(
-            self.materiality_preset_var.get(),
-            MATERIALITY_PRESETS[DEFAULT_MATERIALITY_PRESET_ID],
-        )
-        self.materiality_help_var.set(f"{preset.label}\n감사기준의 의무 비율이 아닌 검토용 프리셋입니다.")
-
     def _select_materiality_preset(self) -> None:
         selected_label = self.materiality_preset_display_var.get()
         for preset in MATERIALITY_PRESETS.values():
             if preset.label == selected_label:
                 self.materiality_preset_var.set(preset.preset_id)
                 break
-        self._update_materiality_help()
+
+    def _enable_source_reload(self) -> None:
+        if getattr(sys, "frozen", False):
+            return
+        self._source_snapshot = self._read_source_snapshot()
+        self._source_change_deadline: float | None = None
+        self._source_reload_scheduled = False
+        self.after(SOURCE_RELOAD_INTERVAL_MS, self._watch_source_files)
+
+    @staticmethod
+    def _read_source_snapshot() -> dict[Path, tuple[int, int]]:
+        snapshot: dict[Path, tuple[int, int]] = {}
+        for path in ROOT.glob("*.py"):
+            try:
+                stat = path.stat()
+                snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+        return snapshot
+
+    def _watch_source_files(self) -> None:
+        if self._source_reload_scheduled:
+            return
+
+        current_snapshot = self._read_source_snapshot()
+        if current_snapshot != self._source_snapshot:
+            self._source_snapshot = current_snapshot
+            self._source_change_deadline = time.monotonic() + 0.7
+
+        if self._source_change_deadline is not None and time.monotonic() >= self._source_change_deadline:
+            self._source_change_deadline = None
+            try:
+                for path in current_snapshot:
+                    compile(path.read_bytes(), str(path), "exec")
+            except (OSError, SyntaxError) as exc:
+                write_ui_debug(f"source_reload_waiting error={exc}")
+                self.status_var.set("코드 변경을 감지했습니다. 문법 오류를 수정하면 자동으로 다시 실행됩니다.")
+            else:
+                self._source_reload_scheduled = True
+                write_ui_debug("source_reload_scheduled")
+                self.status_var.set("코드 변경을 감지했습니다. 수정된 화면으로 자동 재실행합니다...")
+                self.update_idletasks()
+                self.after(150, self._restart_from_source)
+                return
+
+        self.after(SOURCE_RELOAD_INTERVAL_MS, self._watch_source_files)
+
+    def _restart_from_source(self) -> None:
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve())],
+                cwd=str(ROOT),
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            self._source_reload_scheduled = False
+            self.status_var.set(f"자동 재실행에 실패했습니다: {exc}")
+            write_ui_debug(f"source_reload_failed error={exc}")
+            self.after(SOURCE_RELOAD_INTERVAL_MS, self._watch_source_files)
+            return
+        self.destroy()
 
     def log_company_entry_state(self, _event=None) -> None:
         if self.company_entry is None:
@@ -3971,13 +4470,20 @@ class DartOtApp(tk.Tk):
             self.company_entry.tk_focusNext().focus()
         return "break"
 
+    def _sync_native_entries(self) -> None:
+        for entry in self.native_entries:
+            entry.sync()
+
     def get_company_name(self) -> str:
+        if isinstance(self.company_entry, NativeWindowsEntry):
+            self.company_entry.sync()
         return self.company_var.get().strip()
 
     def set_company_name(self, value: str) -> None:
         self.company_var.set(value)
 
     def search_company(self) -> None:
+        self._sync_native_entries()
         api_key = self.api_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
@@ -4028,6 +4534,7 @@ class DartOtApp(tk.Tk):
         self.corp_code_var.set(self.selected_corp.corp_code)
 
     def run_export(self) -> None:
+        self._sync_native_entries()
         api_key = self.api_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("입력 필요", "DART API 키를 입력해 주세요.")
@@ -4041,6 +4548,17 @@ class DartOtApp(tk.Tk):
 
         self.persist_api_key()
         self.status_var.set("DART 공시를 조회하고 엑셀 파일을 생성하고 있습니다. 보고서 수에 따라 시간이 걸릴 수 있습니다.")
+        self._show_result_page()
+        self.result_title_var.set(f"{self.get_company_name()} · 이자비용 검토")
+        self.result_status_var.set("분석을 준비하고 있습니다 · 2%")
+        self.result_progress.configure(value=2)
+        self.result_summary_var.set("DART 공시와 주석을 수집하고 있습니다. 완료되면 연도별 판정과 핵심 수치를 이 화면에서 바로 확인할 수 있습니다.")
+        for value_var in self.result_metric_vars.values():
+            value_var.set("-")
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self.result_open_button.configure(state="disabled")
+        self.result_back_button.configure(state="disabled")
         self._set_buttons_state("disabled")
         threading.Thread(target=self._run_export_worker, daemon=True).start()
 
@@ -4067,27 +4585,85 @@ class DartOtApp(tk.Tk):
             "materialityPreset": self.materiality_preset_var.get(),
         }
         try:
-            result = run_report(payload)
+            result = run_report(payload, progress_callback=self._queue_progress)
             self.after(0, lambda: self._show_export_result(result))
         except Exception as exc:
             self.after(0, lambda: self._show_error(f"실행 중 오류가 발생했습니다: {exc}"))
 
+    def _queue_progress(self, percent: int, message: str) -> None:
+        self.after(0, self._apply_progress, percent, message)
+
+    def _apply_progress(self, percent: int, message: str) -> None:
+        current = int(float(self.result_progress.cget("value")))
+        value = max(current, min(100, int(percent)))
+        self.result_progress.configure(value=value)
+        self.result_status_var.set(f"{message} · {value}%")
+
+    @staticmethod
+    def _format_result_amount(value) -> str:
+        if value is None:
+            return "-"
+        try:
+            return f"{float(value):,.0f}"
+        except (TypeError, ValueError):
+            return str(value)
+
     def _show_export_result(self, result: dict) -> None:
         self._set_buttons_state("normal")
+        self.result_back_button.configure(state="normal")
         self.status_var.set(result.get("message", "작업이 완료되었습니다."))
         self.summary_var.set(
             f"정기보고서: {result.get('reportCount', 0)}    "
             f"차입금 공시: {result.get('noteCount', 0)}    "
             f"오버롤 테스트: {result.get('testCount', 0)}"
         )
-        if result.get("ok") and result.get("file"):
+        if not result.get("ok"):
+            self.result_status_var.set("검토를 완료하지 못했습니다")
+            self.result_summary_var.set(result.get("message", "입력 조건과 공시 조회 결과를 확인해 주세요."))
+            return
+        if result.get("file"):
             self.output_file = OUTPUT_DIR / result["file"]
-            messagebox.showinfo("완료", f"엑셀 파일을 생성했습니다.\n{self.output_file}")
+            self.result_open_button.configure(state="normal", cursor="hand2")
+
+        counts = result.get("judgmentCounts", {})
+        self.result_metric_vars["reports"].set(str(result.get("reportCount", 0)))
+        self.result_metric_vars["tests"].set(str(result.get("testCount", 0)))
+        self.result_metric_vars["within"].set(str(counts.get("기준 이내", 0)))
+        self.result_metric_vars["review"].set(str(counts.get("추가 확인 필요", 0)))
+        self.result_metric_vars["issues"].set(str(result.get("issueCount", 0)))
+        self.result_status_var.set("완료 · 프로그램 내 요약과 엑셀 검토 파일을 생성했습니다 · 100%")
+        self.result_progress.configure(value=100)
+        self.result_title_var.set(f"{result.get('companyName', '-')} · 이자비용 검토 결과")
+        self.result_summary_var.set(
+            f"분석기간  {result.get('beginYear', '-')}~{result.get('endYear', '-')}    |    "
+            f"적용 기준  {result.get('materialityPresetLabel', '-')}    |    "
+            f"차입금 관련 문맥  {result.get('noteCount', 0)}건\n"
+            "금액 단위는 백만원입니다. '추가 확인 필요' 또는 '주의요망' 행을 우선 확인하세요."
+        )
+        for row in result.get("testSummaries", []):
+            judgment = str(row.get("judgment") or "-")
+            tag = "within" if judgment == "기준 이내" else "review" if judgment == "추가 확인 필요" else ""
+            self.result_tree.insert(
+                "", "end",
+                values=(
+                    row.get("reportName") or row.get("receiptDate") or "-",
+                    judgment,
+                    self._format_result_amount(row.get("expectedInterest")),
+                    self._format_result_amount(row.get("actualInterest")),
+                    self._format_result_amount(row.get("difference")),
+                    self._format_result_amount(row.get("threshold")),
+                    row.get("caution") or "-",
+                ),
+                tags=(tag,) if tag else (),
+            )
 
     def _show_error(self, message: str) -> None:
         self._set_buttons_state("normal")
+        self.result_back_button.configure(state="normal")
         self.status_var.set(message)
-        messagebox.showerror("오류", message)
+        self._show_result_page()
+        self.result_status_var.set("오류 · 입력 또는 공시 추출 결과를 확인하세요")
+        self.result_summary_var.set(message)
 
     def _set_buttons_state(self, state: str) -> None:
         for child in self.winfo_children():
@@ -4110,10 +4686,103 @@ class DartOtApp(tk.Tk):
         os.startfile(OUTPUT_DIR)
 
 
+def _acquire_startup_gate():
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, "Local\\DART_OT_STARTUP_GATE")
+    if not handle:
+        return None
+    wait_result = kernel32.WaitForSingleObject(handle, 5000)
+    if wait_result not in (0x00000000, 0x00000080):
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def _release_startup_gate(handle) -> None:
+    if os.name != "nt" or not handle:
+        return
+    kernel32 = ctypes.windll.kernel32
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex(handle)
+    kernel32.CloseHandle(handle)
+
+
+def _existing_dart_ot_windows() -> list[int]:
+    if os.name != "nt":
+        return []
+    user32 = ctypes.windll.user32
+    current_pid = os.getpid()
+    handles: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+
+    @callback_type
+    def collect(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if title.value != "DART-OT":
+            return True
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if process_id.value != current_pid:
+            handles.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(collect, 0)
+    return handles
+
+
+def close_existing_dart_ot_windows() -> int:
+    if os.name != "nt":
+        return 0
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    user32.PostMessageW.restype = wintypes.BOOL
+    handles = _existing_dart_ot_windows()
+    for hwnd in handles:
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    deadline = time.monotonic() + 2.0
+    while handles and time.monotonic() < deadline:
+        time.sleep(0.05)
+        handles = _existing_dart_ot_windows()
+    return len(handles)
+
+
 def main() -> None:
     configure_windows_dpi()
-    app = DartOtApp()
-    app.mainloop()
+    startup_gate = _acquire_startup_gate()
+    try:
+        close_existing_dart_ot_windows()
+        window = DartOtApp()
+        window.update_idletasks()
+    finally:
+        _release_startup_gate(startup_gate)
+    window.mainloop()
 
 
 HTML_PAGE = r"""
@@ -4178,7 +4847,6 @@ HTML_PAGE = r"""
           <option value="assets_05">총자산 0.5% × 25%</option>
           <option value="equity_1">자본총계 1% × 25%</option>
         </select>
-        <p class="help">감사기준의 의무 비율이 아닌 검토용 프리셋입니다. 기업 특성과 검토 목적에 맞게 선택하세요.</p>
         <button id="run" type="submit">오버롤 테스트 실행</button>
       </form>
     </aside>
