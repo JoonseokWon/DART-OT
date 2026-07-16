@@ -4171,15 +4171,38 @@ class DartOtApp(tk.Tk):
         title_block.grid(row=0, column=0, sticky="nw", padx=(0, 24))
         brand_line = tk.Frame(title_block, bg=OT_DARK)
         brand_line.pack(anchor="w")
-        logo = tk.Frame(brand_line, bg=OT_DARK_2, width=58, height=58, highlightbackground=OT_MINT, highlightthickness=2)
-        logo.pack(side="left", padx=(0, 14))
-        logo.pack_propagate(False)
-        tk.Label(logo, text="DO", bg=OT_DARK_2, fg=OT_MINT, font=("Segoe UI", 19, "bold")).pack(expand=True)
+        header_icon_path = BUNDLE_ROOT / "assets" / "DART-OT.png"
+        if header_icon_path.exists():
+            try:
+                self._header_icon_image = tk.PhotoImage(file=header_icon_path).subsample(16, 16)
+                tk.Label(
+                    brand_line,
+                    image=self._header_icon_image,
+                    bg=OT_DARK,
+                    borderwidth=0,
+                ).pack(side="left", padx=(0, 14))
+            except tk.TclError:
+                pass
         brand_text = tk.Frame(brand_line, bg=OT_DARK)
         brand_text.pack(side="left")
         ttk.Label(brand_text, text="DART-OT", style="Title.TLabel").pack(anchor="w")
         tk.Label(brand_text, text="이자비용 오버롤 테스트", bg=OT_DARK, fg="#C9E6E1", font=("맑은 고딕", 10)).pack(anchor="w")
-        tk.Label(title_block, text="DART 공시에서 차입금·이자율·실제 이자비용을 연결해 검토합니다.", bg=OT_DARK, fg="#A9CAC5", font=("맑은 고딕", 9)).pack(anchor="w", pady=(6, 0))
+        description_line = tk.Frame(title_block, bg=OT_DARK)
+        description_line.pack(anchor="w", pady=(5, 0))
+        tk.Label(
+            description_line,
+            text="DART 공시에서 차입금·이자율·실제 이자비용을 연결해 검토합니다.",
+            bg=OT_DARK,
+            fg="#A9CAC5",
+            font=("맑은 고딕", 9),
+        ).pack(side="left")
+        tk.Label(
+            description_line,
+            text="  ·  BY JOONSEOK WON",
+            bg=OT_DARK,
+            fg=OT_MINT,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(side="left")
 
         api_panel = ttk.Frame(header, style="API.TFrame", padding=(14, 8))
         api_panel.grid(row=0, column=1, sticky="new")
