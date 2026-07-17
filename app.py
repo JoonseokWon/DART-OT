@@ -2,6 +2,7 @@ import html
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 import re
 import socket
@@ -526,8 +527,8 @@ def run_report(payload: dict, progress_callback=None) -> dict:
         return fail("알 수 없는 중요성 프리셋입니다. 화면에서 기준을 다시 선택해 주세요.")
 
     report_progress(14, "정기보고서 목록을 조회하고 있습니다")
-    reports = client.get_reports(corp.corp_code, begin_year, end_year)
-    report_progress(22, f"정기보고서 {len(reports)}건을 확인했습니다")
+    candidate_reports = client.get_reports(corp.corp_code, begin_year, end_year)
+    report_progress(22, f"정기보고서 후보 {len(candidate_reports)}건을 확인했습니다")
     borrowing_lines: list[BorrowingLine] = []
     financial_benchmarks: dict[str, FinancialBenchmarks] = {}
     issues: list[ExtractionIssue] = []
@@ -552,9 +553,9 @@ def run_report(payload: dict, progress_callback=None) -> dict:
             report_issues.append(extraction_issue(report, "borrowing_note", exc))
         return report, report_lines, report_benchmarks, report_issues
 
-    max_workers = min(4, max(1, len(reports)))
+    max_workers = min(4, max(1, len(candidate_reports)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(process_report, report): report for report in reports}
+        future_map = {executor.submit(process_report, report): report for report in candidate_reports}
         processed: dict[str, tuple[list[BorrowingLine], FinancialBenchmarks, list[ExtractionIssue]]] = {}
         completed_reports = 0
         for future in as_completed(future_map):
@@ -567,9 +568,10 @@ def run_report(payload: dict, progress_callback=None) -> dict:
                 report_issues = [extraction_issue(report, "report_worker", exc)]
             processed[report.receipt_no] = (report_lines, benchmarks, report_issues)
             completed_reports += 1
-            extraction_percent = 22 + round(48 * completed_reports / max(1, len(reports)))
-            report_progress(extraction_percent, f"공시와 주석을 분석하고 있습니다 ({completed_reports}/{len(reports)})")
+            extraction_percent = 22 + round(48 * completed_reports / max(1, len(candidate_reports)))
+            report_progress(extraction_percent, f"공시와 주석을 분석하고 있습니다 ({completed_reports}/{len(candidate_reports)})")
 
+    reports = select_best_extracted_period_reports(candidate_reports, processed)
     for report in reports:
         report_lines, benchmarks, report_issues = processed.get(report.receipt_no, ([], FinancialBenchmarks(), []))
         borrowing_lines.extend(report_lines)
@@ -758,6 +760,56 @@ def report_period_label(report: DartReport) -> str:
     if not key:
         return ""
     return f"{key[0]}.{key[1]:02d}"
+
+
+def select_latest_period_reports(reports: list[DartReport]) -> list[DartReport]:
+    """Keep the latest filing for each fiscal period, preferring corrections on ties."""
+    latest: dict[tuple[int, int], DartReport] = {}
+    for report in reports:
+        key = report_period_key(report)
+        if key is None or not report_code(report):
+            continue
+        previous = latest.get(key)
+        if previous is None or report_preference_key(report) > report_preference_key(previous):
+            latest[key] = report
+    return sorted(latest.values(), key=lambda report: (report.receipt_date, report.report_name), reverse=True)
+
+
+def select_best_extracted_period_reports(
+    reports: list[DartReport],
+    processed: dict[str, tuple[list[BorrowingLine], FinancialBenchmarks, list[ExtractionIssue]]],
+) -> list[DartReport]:
+    """Prefer the latest filing unless an amendment has no usable note body."""
+    by_period: dict[tuple[int, int], list[DartReport]] = {}
+    for report in reports:
+        key = report_period_key(report)
+        if key is not None and report_code(report):
+            by_period.setdefault(key, []).append(report)
+
+    selected: list[DartReport] = []
+    for period_reports in by_period.values():
+        note_counts = {
+            report.receipt_no: sum(
+                1
+                for line in processed.get(report.receipt_no, ([], FinancialBenchmarks(), []))[0]
+                if line.source_file != "fnlttSinglAcntAll.json"
+            )
+            for report in period_reports
+        }
+        max_note_count = max(note_counts.values(), default=0)
+        minimum_usable_count = max(10, round(max_note_count * 0.25)) if max_note_count else 0
+        usable = [
+            report
+            for report in period_reports
+            if note_counts.get(report.receipt_no, 0) >= minimum_usable_count
+        ]
+        selected.append(max(usable or period_reports, key=report_preference_key))
+    return sorted(selected, key=lambda report: (report.receipt_date, report.report_name), reverse=True)
+
+
+def report_preference_key(report: DartReport) -> tuple[str, int, str]:
+    corrected = int("기재정정" in report.report_name or "첨부정정" in report.report_name)
+    return report.receipt_date, corrected, report.receipt_no
 
 
 def beginning_borrowing_amount(
@@ -1142,7 +1194,7 @@ def extract_interest_expense_lines_from_document(report: DartReport, source_file
         )
 
     section_pattern = re.compile(
-        r"\d{1,3}\.\s*(?:금융수익\s*(?:및|과)\s*)?금융(?:비용|원가)(?:의\s*내역|내역)?"
+        r"\d{1,3}\.\s*(?:(?:금융수익\s*(?:및|과)\s*)?금융(?:비용|원가)|금융손익)(?:의\s*내역|내역)?"
     )
     for section_match in section_pattern.finditer(plain):
         start = section_match.start()
@@ -1345,6 +1397,8 @@ def borrowing_lines_from_table_rows(
 
     percent_unit_context = is_percent_rate_unit_context(table_text)
     for row_idx, cells in enumerate(table_rows):
+        if is_prior_period_table_segment(table_rows, row_idx):
+            continue
         label = first_text_cell(cells)
         if not label:
             continue
@@ -1600,7 +1654,7 @@ def is_table_borrowing_amount_row(cells: list[str]) -> bool:
     compact = re.sub(r"\s+", "", label)
     if not compact:
         return False
-    if any(keyword in compact for keyword in ("이자율", "이율", "금리", "할인", "할증", "차감", "기술", "기초통화", "상환일", "발행일")):
+    if any(keyword in compact for keyword in ("이자율", "이율", "금리", "할인", "할증", "차감", "기술", "기초통화", "상환일", "발행일", "합계", "총계", "소계")):
         return False
     return any(keyword in compact for keyword in ("차입금", "단기차입", "장기차입", "유동성장기차입", "사채", "회사채", "은행차입"))
 
@@ -1768,6 +1822,7 @@ def note_section_for_context(text: str) -> str:
             "금융수익과금융비용",
             "금융수익및금융원가",
             "금융수익과금융원가",
+            "금융손익",
             "재무수익및재무비용",
             "재무수익과재무비용",
             "재무수익및재무원가",
@@ -1950,7 +2005,11 @@ def build_overall_tests(
         amount_change = amount_diff / yoy_amount_sum if amount_diff is not None and yoy_amount_sum not in (None, 0) else None
         amount_comparison_label = f"전년동기 {report_period_label(yoy_report)}" if yoy_report else "전년동기 비교대상 없음"
         min_rate = min(rates) if rates else None
-        avg_rate = weighted_rate if weighted_rate is not None else (sum(rates) / len(rates) if rates else None)
+        focused_rate = focused_disclosed_interest_rate(target_rate_lines, amount_sum)
+        avg_rate = weighted_rate if weighted_rate is not None else focused_rate
+        used_wide_range_fallback = False
+        if avg_rate is None and rates:
+            avg_rate, used_wide_range_fallback = fallback_interest_rate(rates)
         max_rate = max(rates) if rates else None
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
@@ -2087,6 +2146,11 @@ def build_overall_tests(
             )
 
         calc_notes: list[str] = []
+        if used_wide_range_fallback and min_rate is not None and max_rate is not None:
+            calc_notes.append(
+                f"금액별 금리 부족 및 공시 금리 범위가 넓어 "
+                f"{min_rate:.2%}~{max_rate:.2%}의 기하평균 {avg_rate:.2%} 적용"
+            )
         if rate_interest_estimate is not None and expected_interest_expense is not None:
             calc_notes.append(
                 f"금리 있는 차입금/사채 {rate_interest_estimate.covered_amount:,.0f}백만원 "
@@ -2225,11 +2289,26 @@ def calculate_borrowing_amount(lines: list[BorrowingLine]) -> tuple[int, int, st
 
     total_candidates = [(line, amount) for line, amount in candidates if is_total_amount_context(line.context)]
     if total_candidates:
-        selected_line, selected_amount = select_total_amount_candidate(total_candidates)
+        financial_amount, financial_line = financial_statement_borrowing_amount(financial_api_lines)
+        selected_line, selected_amount = select_total_amount_candidate(total_candidates, financial_amount)
         if selected_amount == 0 and rate_amount_candidates:
             amount_sum = sum(amount for _, amount in rate_amount_candidates)
             max_amount = max((amount for _, amount in rate_amount_candidates), default=0)
             return amount_sum, max_amount, "차입금/사채 합계 0으로 공시되어 이자율이 있는 사채 항목 금액 사용", [line for line, _ in rate_amount_candidates]
+        if financial_amount > 0 and selected_amount > financial_amount * 1.5:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 합계 {selected_amount:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과대하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
+        if financial_amount > 0 and selected_amount < financial_amount * 0.75:
+            return (
+                financial_amount,
+                financial_amount,
+                f"주석 합계 {selected_amount:,}백만원이 재무상태표 API 차입잔액 {financial_amount:,}백만원 대비 과소하여 재무상태표 API 사용",
+                [financial_line] if financial_line else [],
+            )
         return selected_amount, selected_amount, "차입금/사채 주석 합계/총계 행 사용", [selected_line]
 
     selected: list[tuple[BorrowingLine, int]] = []
@@ -2277,14 +2356,15 @@ def financial_statement_borrowing_amount(lines: list[BorrowingLine]) -> tuple[in
     return amount, selected_line
 
 
-def select_total_amount_candidate(candidates: list[tuple[BorrowingLine, int]]) -> tuple[BorrowingLine, int]:
+def select_total_amount_candidate(
+    candidates: list[tuple[BorrowingLine, int]],
+    reference_amount: int = 0,
+) -> tuple[BorrowingLine, int]:
     positive = [(line, amount) for line, amount in candidates if amount > 0]
     if not positive:
         return max(candidates, key=lambda item: item[1])
-    min_amount = min(amount for _, amount in positive)
-    max_amount = max(amount for _, amount in positive)
-    if min_amount > 0 and max_amount / min_amount > 20:
-        return min(positive, key=lambda item: item[1])
+    if reference_amount > 0:
+        return min(positive, key=lambda item: abs(item[1] - reference_amount) / reference_amount)
     return max(positive, key=lambda item: item[1])
 
 
@@ -2503,11 +2583,21 @@ def extract_note_interest_expense(lines: list[BorrowingLine]) -> FinancialExpens
     total_candidates = [(line, amount) for line, amount in candidates if is_total_interest_expense_candidate(line.context)]
     if total_candidates:
         selected_line, amount = max(total_candidates, key=lambda item: finance_cost_interest_candidate_score(item[0], item[1]))
+        borrowing_component_amount = extract_amortized_financial_liability_interest_amount(
+            selected_line.context,
+            selected_line.amount_unit,
+            selected_line.report_name,
+        )
+        if borrowing_component_amount is not None:
+            amount = borrowing_component_amount
+            memo = "금융비용 주석 중 상각후원가 금융부채 이자비용 사용"
+        else:
+            memo = "금융비용 주석의 당기 이자비용 우선 사용"
         return FinancialExpense(
             selected_line.receipt_no,
             amount,
             "이자비용(금융원가)",
-            "금융비용 주석의 당기 이자비용 우선 사용",
+            memo,
         )
 
     groups: list[list[tuple[BorrowingLine, int]]] = []
@@ -2587,6 +2677,17 @@ def is_explanatory_interest_expense_context(text: str) -> bool:
 
 def is_total_interest_expense_candidate(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
+    has_explicit_finance_cost_total = any(
+        keyword in compact
+        for keyword in (
+            "금융비용:이자비용",
+            "금융원가:이자비용",
+            "금융비용의내역은다음과같습니다",
+            "금융원가의내역은다음과같습니다",
+        )
+    )
+    if has_explicit_finance_cost_total and "이자비용" in compact:
+        return True
     if is_amortized_financial_liability_interest(text):
         return False
     if any(keyword in compact for keyword in ("기타금융부채이자비용", "차입금이자비용", "사채이자비용", "금융부채이자비용")):
@@ -2601,11 +2702,12 @@ def interest_expense_candidate_score(line: BorrowingLine, amount: int) -> tuple[
     return period_score, consolidated_score, -line.line_no, full_context_score, -amount
 
 
-def finance_cost_interest_candidate_score(line: BorrowingLine, amount: int) -> tuple[int, int, int, int, int, int, int, int]:
+def finance_cost_interest_candidate_score(line: BorrowingLine, amount: int) -> tuple[int, int, int, int, int, int, int, int, int]:
     compact = re.sub(r"\s+", "", line.context)
     section_score = 2 if line.section == "금융비용 주석" else 0
     finance_cost_note_score = 1 if any(keyword in compact for keyword in ("금융비용", "금융원가", "금융비용의내역", "금융원가의내역")) else 0
     exact_interest_row_score = 1 if any(keyword in compact for keyword in ("이자비용(금융비용)", "이자비용(금융원가)", "구분당기전기이자비용")) else 0
+    consolidated_score = consolidated_context_score(line.context)
     period_score = interest_context_period_score(line.context)
     direct_row_score = 1 if line.line_no != 1 else 0
     connected_order_score = -line.line_no if line.line_no != 1 else -999_999
@@ -2614,6 +2716,7 @@ def finance_cost_interest_candidate_score(line: BorrowingLine, amount: int) -> t
         section_score,
         finance_cost_note_score,
         exact_interest_row_score,
+        consolidated_score,
         period_score,
         direct_row_score,
         connected_order_score,
@@ -2794,6 +2897,33 @@ def extract_total_interest_expense_amount(text: str, unit: str, report_name: str
         prefix = re.sub(r"\s+", "", text[max(0, match.start() - 20) : match.start()])
         if any(keyword in prefix for keyword in ("상각후원가", "기타금융부채", "차입금", "사채", "금융부채")):
             continue
+        tail = text[match.end() : match.end() + 160]
+        amount_matches = re.findall(amount_pattern, tail)
+        if not amount_matches:
+            continue
+        raw = amount_matches[interest_expense_amount_index(report_name, len(amount_matches))]
+        value = parse_signed_amount(raw)
+        if value is None:
+            continue
+        return normalize_interest_amount_to_million(abs(value), compact_unit)
+    return None
+
+
+def extract_amortized_financial_liability_interest_amount(
+    text: str,
+    unit: str,
+    report_name: str = "",
+) -> int | None:
+    """Read the borrowing-related component below a finance-cost interest total."""
+    if "이자비용" not in re.sub(r"\s+", "", text):
+        return None
+    compact_unit = re.sub(r"\s+", "", unit or "")
+    explicit_unit = detect_amount_unit(text)
+    if explicit_unit:
+        compact_unit = re.sub(r"\s+", "", explicit_unit)
+    label_pattern = r"상각후원가(?:로)?\s*(?:측정(?:된|하는)?)?\s*금융부채"
+    amount_pattern = r"\(?-?\d{1,3}(?:,\d{3})+\)?"
+    for match in re.finditer(label_pattern, text):
         tail = text[match.end() : match.end() + 160]
         amount_matches = re.findall(amount_pattern, tail)
         if not amount_matches:
@@ -3109,6 +3239,18 @@ def estimation_interest_rates(line: BorrowingLine) -> list[float]:
     return [rate for rate in line.interest_rates if is_reasonable_interest_rate(rate)]
 
 
+def fallback_interest_rate(rates: list[float]) -> tuple[float, bool]:
+    """Use a robust center when a global borrowing-rate range has extreme dispersion."""
+    usable = [rate for rate in rates if is_reasonable_interest_rate(rate)]
+    if not usable:
+        raise ValueError("fallback_interest_rate requires at least one usable rate")
+    minimum = min(usable)
+    maximum = max(usable)
+    if minimum > 0 and maximum >= 0.15 and maximum / minimum >= 10:
+        return math.sqrt(minimum * maximum), True
+    return sum(usable) / len(usable), False
+
+
 def weighted_average_interest_rate(
     lines: list[BorrowingLine],
     reference_amount: int,
@@ -3142,9 +3284,58 @@ def weighted_average_interest_rate(
         amount_total += amount
     if not weight_total:
         return None
+    if reference_amount > 0 and amount_total > reference_amount * 1.5:
+        return None
     if reference_amount > 0 and amount_total < reference_amount * 0.5:
         return None
     return weighted_sum / weight_total
+
+
+def focused_disclosed_interest_rate(lines: list[BorrowingLine], reference_amount: int) -> float | None:
+    """Weight explicit borrowing-table rates while avoiding generic totals and scale duplicates."""
+    detailed_keywords = (
+        "원화단기차입금",
+        "외화단기차입금",
+        "원화장기차입금",
+        "외화장기차입금",
+        "회사채",
+        "무보증사채",
+        "사채,명목금액",
+    )
+    generic_long_term_keyword = "명목금액_장기차입금"
+
+    def collect(include_generic_long_term: bool) -> list[tuple[int, float]]:
+        pairs: list[tuple[int, float]] = []
+        seen: set[tuple[int, float]] = set()
+        for line in lines:
+            compact = re.sub(r"\s+", "", line.context)
+            if any(keyword in compact for keyword in ("합계", "총계", "소계")):
+                continue
+            is_detailed = any(keyword in compact for keyword in detailed_keywords)
+            is_generic_long_term = generic_long_term_keyword in compact
+            if not is_detailed and not (include_generic_long_term and is_generic_long_term):
+                continue
+            amount = extract_current_amount(line)
+            rate = representative_interest_rate_for_weighting(line)
+            if amount is None or amount <= 0 or rate is None:
+                continue
+            amount = normalize_rate_line_amount(amount, reference_amount)
+            if amount is None:
+                continue
+            key = (amount, round(rate, 8))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((amount, rate))
+        return pairs
+
+    detailed_pairs = collect(False)
+    minimum_coverage = reference_amount * 0.3 if reference_amount > 0 else 0
+    pairs = detailed_pairs if sum(amount for amount, _ in detailed_pairs) >= minimum_coverage else collect(True)
+    amount_total = sum(amount for amount, _ in pairs)
+    if not amount_total or (reference_amount > 0 and amount_total < minimum_coverage):
+        return None
+    return sum(amount * rate for amount, rate in pairs) / amount_total
 
 
 def rate_line_interest_estimate(
@@ -3183,6 +3374,8 @@ def rate_line_interest_estimate(
         amount_total += amount
         line_count += 1
     if not weight_total:
+        return None
+    if reference_amount > 0 and amount_total > reference_amount * 1.5:
         return None
     if reference_amount > 0 and amount_total < reference_amount * 0.3:
         return None
@@ -3257,10 +3450,24 @@ def interest_rate_weight_months(text: str, default_months: int) -> int:
 def representative_interest_rate_for_weighting(line: BorrowingLine) -> float | None:
     if any(rate > 0.50 for rate in line.interest_rates):
         return None
-    rates = [rate for rate in line.interest_rates if 0 <= rate <= 0.50]
+    rates = collapse_scale_duplicate_rates([rate for rate in line.interest_rates if 0 <= rate <= 0.50])
     if not rates or not any(rate > 0 for rate in rates):
         return None
     return (min(rates) + max(rates)) / 2
+
+
+def collapse_scale_duplicate_rates(rates: list[float]) -> list[float]:
+    """Drop parser duplicates such as 0.03% and 3.00% from the same disclosure row."""
+    unique_rates = list(dict.fromkeys(rates))
+    collapsed: list[float] = []
+    for rate in unique_rates:
+        if any(
+            other > rate and abs(other - rate * 100) <= max(1e-9, other * 1e-6)
+            for other in unique_rates
+        ):
+            continue
+        collapsed.append(rate)
+    return collapsed
 
 def is_special_bond_context(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
@@ -4093,7 +4300,14 @@ class DartOtApp(tk.Tk):
         self._set_icon()
         self.geometry("1280x820")
         self.minsize(1180, 760)
-        self.selected_corp: CorpInfo | None = None
+        saved_company_name = str(self.config.get("last_company_name", "")).strip()
+        saved_stock_code = str(self.config.get("last_stock_code", "")).strip()
+        saved_corp_code = str(self.config.get("last_corp_code", "")).strip()
+        self.selected_corp: CorpInfo | None = (
+            CorpInfo(saved_corp_code, saved_company_name, saved_stock_code)
+            if saved_company_name and saved_corp_code
+            else None
+        )
         self.search_results: list[CorpInfo] = []
         self.output_file: Path | None = None
         self.native_entries: list[NativeWindowsEntry] = []
@@ -4102,10 +4316,10 @@ class DartOtApp(tk.Tk):
 
         self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.save_api_key_var = tk.BooleanVar(value=bool(self.config.get("api_key", "")))
-        self.company_var = tk.StringVar(value="삼성전자")
+        self.company_var = tk.StringVar(value=saved_company_name)
         self.company_entry: NativeWindowsEntry | ttk.Entry | None = None
-        self.stock_var = tk.StringVar()
-        self.corp_code_var = tk.StringVar()
+        self.stock_var = tk.StringVar(value=saved_stock_code)
+        self.corp_code_var = tk.StringVar(value=saved_corp_code)
         self.begin_year_var = tk.StringVar(value=str(datetime.now().year - 4))
         self.end_year_var = tk.StringVar(value=str(datetime.now().year))
         saved_preset = self.config.get("materiality_preset", DEFAULT_MATERIALITY_PRESET_ID)
@@ -4113,7 +4327,12 @@ class DartOtApp(tk.Tk):
             saved_preset = DEFAULT_MATERIALITY_PRESET_ID
         self.materiality_preset_var = tk.StringVar(value=saved_preset)
         self.materiality_preset_display_var = tk.StringVar(value=MATERIALITY_PRESETS[saved_preset].label)
-        self.status_var = tk.StringVar(value="DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요.")
+        initial_status = (
+            f"마지막으로 선택한 회사 {saved_company_name}을(를) 불러왔습니다."
+            if self.selected_corp is not None
+            else "DART API 키와 회사명을 입력한 뒤 회사 검색을 눌러 주세요."
+        )
+        self.status_var = tk.StringVar(value=initial_status)
         self.summary_var = tk.StringVar(value="정기보고서: -    차입금 공시: -    오버롤 테스트: -")
 
         self._build()
@@ -4516,7 +4735,7 @@ class DartOtApp(tk.Tk):
         self.corp_code_var.set("")
         if self.get_company_name():
             self.stock_var.set("")
-        self.persist_api_key()
+        self.persist_preferences()
         self.status_var.set("회사 목록을 조회하고 있습니다.")
         self._set_buttons_state("disabled")
         threading.Thread(target=self._search_company_worker, args=(api_key,), daemon=True).start()
@@ -4555,6 +4774,7 @@ class DartOtApp(tk.Tk):
         self.set_company_name(self.selected_corp.corp_name)
         self.stock_var.set(self.selected_corp.stock_code)
         self.corp_code_var.set(self.selected_corp.corp_code)
+        self.persist_preferences(self.selected_corp)
 
     def run_export(self) -> None:
         self._sync_native_entries()
@@ -4569,7 +4789,7 @@ class DartOtApp(tk.Tk):
             messagebox.showwarning("회사 선택 필요", "회사 검색 후 목록에서 회사를 선택해 주세요.")
             return
 
-        self.persist_api_key()
+        self.persist_preferences(self.selected_corp)
         self.status_var.set("DART 공시를 조회하고 엑셀 파일을 생성하고 있습니다. 보고서 수에 따라 시간이 걸릴 수 있습니다.")
         self._show_result_page()
         self.result_title_var.set(f"{self.get_company_name()} · 이자비용 검토")
@@ -4585,17 +4805,27 @@ class DartOtApp(tk.Tk):
         self._set_buttons_state("disabled")
         threading.Thread(target=self._run_export_worker, daemon=True).start()
 
-    def persist_api_key(self) -> None:
+    def persist_preferences(self, company: CorpInfo | None = None) -> None:
+        config = {
+            "materiality_preset": self.materiality_preset_var.get(),
+        }
         if self.save_api_key_var.get():
-            save_config({
-                "api_key": self.api_key_var.get().strip(),
-                "materiality_preset": self.materiality_preset_var.get(),
+            config["api_key"] = self.api_key_var.get().strip()
+
+        if company is not None:
+            config.update({
+                "last_company_name": company.corp_name,
+                "last_stock_code": company.stock_code,
+                "last_corp_code": company.corp_code,
             })
-        elif CONFIG_PATH.exists():
-            try:
-                CONFIG_PATH.unlink()
-            except OSError:
-                pass
+        else:
+            for key in ("last_company_name", "last_stock_code", "last_corp_code"):
+                value = str(self.config.get(key, "")).strip()
+                if value:
+                    config[key] = value
+
+        save_config(config)
+        self.config = config
 
     def _run_export_worker(self) -> None:
         payload = {

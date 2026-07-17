@@ -52,6 +52,13 @@ foreach ($Target in $Targets) {
         }
         $BrandArgs = @("--icon", $IconPath, "--add-data", "$PngPath;assets")
     }
+    elseif ($Target.Name -eq "DART-Disclosure-Viewer") {
+        $IconPath = Join-Path $Root "assets\DART-Disclosure-Viewer.ico"
+        if (-not (Test-Path -LiteralPath $IconPath)) {
+            throw "Missing DART Disclosure Viewer icon. Run scripts/build_icon.py first."
+        }
+        $BrandArgs = @("--icon", $IconPath)
+    }
     & $Python -m PyInstaller `
         --noconfirm `
         --clean `
