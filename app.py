@@ -1898,6 +1898,30 @@ def interest_judgment_basis(
     return " ".join(parts)
 
 
+def interest_range_judgment_basis(
+    expected: float,
+    actual: float,
+    point_diff: float,
+    range_low: float,
+    range_high: float,
+    range_diff: float,
+    min_rate: float,
+    max_rate: float,
+    materiality: MaterialityResult,
+) -> str:
+    if range_diff == 0:
+        range_text = "실제 이자비용이 공시 금리 범위의 예상이자 안에 있음."
+    else:
+        range_text = "실제 이자비용의 공시 금리 범위 이탈액이 선택한 허용차이 이내임."
+    return (
+        f"가중평균금리 점추정 차이는 {point_diff:,.0f}백만원이나 {range_text} "
+        f"점추정 {expected:,.0f}백만원, 실제 {actual:,.0f}백만원. "
+        f"공시 금리 {min_rate:.2%}~{max_rate:.2%} 적용 예상범위 "
+        f"{range_low:,.0f}~{range_high:,.0f}백만원. "
+        f"범위 이탈액 {range_diff:,.0f}백만원. {materiality_comparison_basis(range_diff, materiality)}"
+    )
+
+
 def materiality_threshold_from_revenue(revenue: int) -> float:
     return revenue * 0.01 * 0.25
 
@@ -1975,6 +1999,7 @@ def build_overall_tests(
             latest_report_by_period[key] = report
 
     rows: list[dict] = []
+    latest_reliable_rate_profile: tuple[float, float, float, str] | None = None
     for report in sorted(reports, key=lambda r: (r.receipt_date, r.report_name)):
         report_lines = by_receipt.get(report.receipt_no, [])
         comparison_rate_lines = [line for line in report_lines if is_comparison_rate_context(line.context)]
@@ -2008,9 +2033,21 @@ def build_overall_tests(
         focused_rate = focused_disclosed_interest_rate(target_rate_lines, amount_sum)
         avg_rate = weighted_rate if weighted_rate is not None else focused_rate
         used_wide_range_fallback = False
+        used_prior_rate_fallback = False
+        prior_rate_source = ""
         if avg_rate is None and rates:
             avg_rate, used_wide_range_fallback = fallback_interest_rate(rates)
         max_rate = max(rates) if rates else None
+        if avg_rate is not None and min_rate is not None and max_rate is not None:
+            latest_reliable_rate_profile = (
+                avg_rate,
+                min_rate,
+                max_rate,
+                report_period_label(report),
+            )
+        elif avg_rate is None and latest_reliable_rate_profile is not None:
+            avg_rate, min_rate, max_rate, prior_rate_source = latest_reliable_rate_profile
+            used_prior_rate_fallback = True
         avg_benchmark_rate = sum(benchmark_rates) / len(benchmark_rates) if benchmark_rates else None
         benchmark_diff = avg_rate - avg_benchmark_rate if avg_rate is not None and avg_benchmark_rate is not None else None
         benchmark_error_rate = benchmark_diff / avg_benchmark_rate if benchmark_diff is not None and avg_benchmark_rate not in (None, 0) else None
@@ -2049,6 +2086,24 @@ def build_overall_tests(
             expected_interest_expense += conversion_amortization
         interest_expense_diff = absolute_amount_diff(actual_interest_expense, expected_interest_expense) if actual_interest_comparable and expected_interest_expense is not None else None
         interest_expense_error_rate = interest_expense_diff / expected_interest_expense if interest_expense_diff is not None and expected_interest_expense not in (None, 0) else None
+        range_expected_low = None
+        range_expected_high = None
+        range_interest_diff = None
+        if (
+            actual_interest_comparable
+            and average_borrowing_balance
+            and min_rate is not None
+            and max_rate is not None
+        ):
+            range_expected_low = average_borrowing_balance * min_rate * period_factor + conversion_amortization
+            range_expected_high = average_borrowing_balance * max_rate * period_factor + conversion_amortization
+            range_expected_low, range_expected_high = sorted((range_expected_low, range_expected_high))
+            if actual_interest_expense < range_expected_low:
+                range_interest_diff = range_expected_low - actual_interest_expense
+            elif actual_interest_expense > range_expected_high:
+                range_interest_diff = actual_interest_expense - range_expected_high
+            else:
+                range_interest_diff = 0.0
         amount_units = sorted({line.amount_unit for line in amount_used_lines if line.max_amount and line.amount_unit})
         amount_unit = ""
         if len(amount_units) == 1:
@@ -2120,6 +2175,24 @@ def build_overall_tests(
                 f"선택한 프리셋의 {materiality.preset.benchmark_label}이 없거나 0 이하이므로 허용차이를 산정할 수 없음. "
                 f"{materiality_formula_text(materiality)}."
             )
+        elif (
+            interest_expense_diff is not None
+            and range_interest_diff is not None
+            and abs(interest_expense_diff) > materiality_threshold
+            and abs(range_interest_diff) <= materiality_threshold
+        ):
+            judgment = "기준 이내"
+            judgment_basis = interest_range_judgment_basis(
+                expected_interest_expense,
+                actual_interest_expense,
+                interest_expense_diff,
+                range_expected_low,
+                range_expected_high,
+                range_interest_diff,
+                min_rate,
+                max_rate,
+                materiality,
+            )
         elif interest_expense_diff is not None and abs(interest_expense_diff) <= materiality_threshold:
             judgment = "기준 이내"
             judgment_basis = interest_judgment_basis(
@@ -2150,6 +2223,11 @@ def build_overall_tests(
             calc_notes.append(
                 f"금액별 금리 부족 및 공시 금리 범위가 넓어 "
                 f"{min_rate:.2%}~{max_rate:.2%}의 기하평균 {avg_rate:.2%} 적용"
+            )
+        if used_prior_rate_fallback:
+            calc_notes.append(
+                f"당기 금액연결 금리 미검출로 직전 신뢰 가능 공시({prior_rate_source})의 "
+                f"적용이자율 {avg_rate:.2%}, 금리범위 {min_rate:.2%}~{max_rate:.2%} 참고 적용"
             )
         if rate_interest_estimate is not None and expected_interest_expense is not None:
             calc_notes.append(
@@ -3106,6 +3184,8 @@ def is_valid_borrowing_rate_line(line: BorrowingLine) -> bool:
         return False
     if not is_borrowing_target_context(line.context):
         return False
+    if extract_current_amount(line) is None:
+        return False
     return is_valid_borrowing_rate_context(line.context, allow_mixed_lease=True)
 
 
@@ -3861,6 +3941,8 @@ def save_workbook(
                 "금액산정방식",
                 "차입금문맥수",
                 "이자비용산정메모",
+                "주의요망",
+                "주의요망 사유",
             ],
             [
                 [
@@ -3887,6 +3969,8 @@ def save_workbook(
                     t["amount_method"],
                     t["context_count"],
                     t["interest_expense_memo"],
+                    t["caution_status"],
+                    t["caution_reason"],
                 ]
                 for t in tests
             ],
@@ -4546,11 +4630,20 @@ class DartOtApp(tk.Tk):
         self.result_summary_var = tk.StringVar(value="분석을 실행하면 회사와 적용 기준 요약이 표시됩니다.")
         tk.Label(detail, text="즉시 확인 요약", bg=OT_WHITE, fg=OT_DARK, font=("맑은 고딕", 13, "bold")).grid(row=0, column=0, sticky="w")
         tk.Label(detail, textvariable=self.result_summary_var, bg=OT_WHITE, fg=OT_INK, font=("맑은 고딕", 10), anchor="w", justify="left", wraplength=1050).grid(row=1, column=0, sticky="ew", pady=(5, 12))
-        columns = ("report", "judgment", "expected", "actual", "difference", "threshold", "caution")
+        columns = ("report", "judgment", "expected", "actual", "difference", "threshold", "caution", "caution_reason")
         self.result_tree = ttk.Treeview(detail, columns=columns, show="headings", height=8)
-        for key, label, width in (("report", "보고서", 250), ("judgment", "판정", 115), ("expected", "계산 이자", 120), ("actual", "실제 이자", 120), ("difference", "차이", 110), ("threshold", "허용차이", 110), ("caution", "주의", 90)):
+        for key, label, width in (
+            ("report", "보고서", 175),
+            ("judgment", "판정", 105),
+            ("expected", "계산 이자", 90),
+            ("actual", "실제 이자", 90),
+            ("difference", "차이", 90),
+            ("threshold", "허용차이", 90),
+            ("caution", "주의", 80),
+            ("caution_reason", "주의요망 사유", 280),
+        ):
             self.result_tree.heading(key, text=label)
-            self.result_tree.column(key, width=width, anchor="center" if key != "report" else "w")
+            self.result_tree.column(key, width=width, anchor="w" if key in ("report", "caution_reason") else "center")
         self.result_tree.tag_configure("review", background="#FFF1E8", foreground="#8A3B12")
         self.result_tree.tag_configure("within", background="#ECF9F5", foreground="#0B6658")
         self.result_tree.grid(row=2, column=0, sticky="nsew")
@@ -4906,6 +4999,7 @@ class DartOtApp(tk.Tk):
                     self._format_result_amount(row.get("difference")),
                     self._format_result_amount(row.get("threshold")),
                     row.get("caution") or "-",
+                    row.get("cautionReason") or "-",
                 ),
                 tags=(tag,) if tag else (),
             )
