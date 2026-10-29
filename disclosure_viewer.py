@@ -6,16 +6,15 @@ import socket
 import sys
 import threading
 import urllib.parse
-import urllib.request
 import webbrowser
-import zipfile
 from datetime import datetime
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
 from pathlib import Path
 from html.parser import HTMLParser
 from xml.etree import ElementTree
+
+from dart_api import get_dart_bytes, parse_dart_json, read_dart_xml_files
 
 
 def runtime_root() -> Path:
@@ -302,9 +301,8 @@ class DartClient:
                 pass
 
         data = self._get_bytes("https://opendart.fss.or.kr/api/corpCode.xml", {"crtfc_key": self.api_key})
-        with zipfile.ZipFile(BytesIO(data)) as archive:
-            name = next(n for n in archive.namelist() if n.lower().endswith(".xml"))
-            root = ElementTree.fromstring(archive.read(name))
+        _, xml_data = read_dart_xml_files(data)[0]
+        root = ElementTree.fromstring(xml_data)
         corps: list[CorpInfo] = []
         for node in root.findall("list"):
             corp_code = text_of(node, "corp_code")
@@ -369,14 +367,7 @@ class DartClient:
         if receipt_no in _DOCUMENT_FILES:
             return _DOCUMENT_FILES[receipt_no]
         data = self._get_bytes("https://opendart.fss.or.kr/api/document.xml", {"crtfc_key": self.api_key, "rcept_no": receipt_no})
-        files: list[tuple[str, str]] = []
-        try:
-            with zipfile.ZipFile(BytesIO(data)) as archive:
-                for name in archive.namelist():
-                    if name.lower().endswith(".xml"):
-                        files.append((Path(name).name, decode_dart_document(archive.read(name))))
-        except zipfile.BadZipFile:
-            files.append((f"{receipt_no}.xml", decode_dart_document(data)))
+        files = [(Path(name).name, decode_dart_document(content)) for name, content in read_dart_xml_files(data)]
         _DOCUMENT_FILES[receipt_no] = files
         return files
 
@@ -411,13 +402,10 @@ class DartClient:
         }
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
-        return json.loads(self._get_bytes(url, params).decode("utf-8", errors="ignore"))
+        return parse_dart_json(self._get_bytes(url, params))
 
     def _get_bytes(self, url: str, params: dict[str, str]) -> bytes:
-        query = urllib.parse.urlencode(params)
-        request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "DART-Disclosure-Viewer/1.0"})
-        with urllib.request.urlopen(request, timeout=50) as response:
-            return response.read()
+        return get_dart_bytes(url, params, timeout=50, user_agent="DART-Disclosure-Viewer/1.1")
 
 
 class Handler(BaseHTTPRequestHandler):

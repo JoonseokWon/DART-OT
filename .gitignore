@@ -8,3 +8,5 @@ outputs/
 *.user
 *.suo
 *.spec
+__pycache__/
+*.py[cod]

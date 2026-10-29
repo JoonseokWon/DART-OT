@@ -21,11 +21,12 @@ import calendar
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter.font as tkfont
 from xml.etree import ElementTree
+
+from dart_api import check_dart_status, get_dart_bytes, parse_dart_json, read_dart_xml_files
 
 
 def runtime_root() -> Path:
@@ -35,6 +36,7 @@ def runtime_root() -> Path:
 
 
 ROOT = runtime_root()
+APP_VERSION = "0.1.1"
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
@@ -252,9 +254,7 @@ class DartClient:
 
     def get_corp_codes(self) -> list[CorpInfo]:
         data = self._get_bytes("https://opendart.fss.or.kr/api/corpCode.xml", {"crtfc_key": self.api_key})
-        with zipfile.ZipFile(BytesIO(data)) as archive:
-            name = next(n for n in archive.namelist() if n.lower().endswith(".xml"))
-            xml_data = archive.read(name)
+        _, xml_data = read_dart_xml_files(data)[0]
 
         root = ElementTree.fromstring(xml_data)
         corps: list[CorpInfo] = []
@@ -321,6 +321,7 @@ class DartClient:
                     "fs_div": fs_div,
                 },
             )
+            check_dart_status(data, allow_no_data=True)
             if data.get("status") == "000" and data.get("list"):
                 rows = data.get("list", [])
                 self._financial_rows_cache[cache_key] = rows
@@ -478,25 +479,15 @@ class DartClient:
             {"crtfc_key": self.api_key, "rcept_no": receipt_no},
         )
 
-        files: list[tuple[str, str]] = []
-        try:
-            with zipfile.ZipFile(BytesIO(data)) as archive:
-                for name in archive.namelist():
-                    if name.lower().endswith(".xml"):
-                        files.append((name, decode_dart_document(archive.read(name))))
-        except zipfile.BadZipFile:
-            files.append((f"{receipt_no}.xml", decode_dart_document(data)))
+        files = [(name, decode_dart_document(content)) for name, content in read_dart_xml_files(data)]
         self._document_text_cache[receipt_no] = files
         return files
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict:
-        return json.loads(self._get_bytes(url, params).decode("utf-8", errors="ignore"))
+        return parse_dart_json(self._get_bytes(url, params))
 
     def _get_bytes(self, url: str, params: dict[str, str]) -> bytes:
-        query = urllib.parse.urlencode(params)
-        request = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "DART-OT/1.0"})
-        with urllib.request.urlopen(request, timeout=40) as response:
-            return response.read()
+        return get_dart_bytes(url, params, timeout=40, user_agent="DART-OT/1.1")
 
 
 def run_report(payload: dict, progress_callback=None) -> dict:
@@ -528,6 +519,8 @@ def run_report(payload: dict, progress_callback=None) -> dict:
 
     report_progress(14, "정기보고서 목록을 조회하고 있습니다")
     candidate_reports = client.get_reports(corp.corp_code, begin_year, end_year)
+    if not candidate_reports:
+        return fail("조회된 정기보고서가 없습니다. 회사와 조회기간을 확인한 뒤 다시 실행해 주세요.")
     report_progress(22, f"정기보고서 후보 {len(candidate_reports)}건을 확인했습니다")
     borrowing_lines: list[BorrowingLine] = []
     financial_benchmarks: dict[str, FinancialBenchmarks] = {}
@@ -583,7 +576,15 @@ def run_report(payload: dict, progress_callback=None) -> dict:
     OUTPUT_DIR.mkdir(exist_ok=True)
     file_name = f"DART_OT_{safe_filename(corp.corp_name)}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     report_progress(88, "검토 결과 엑셀 파일을 생성하고 있습니다")
-    save_workbook(OUTPUT_DIR / file_name, reports, borrowing_lines, tests, issues)
+    save_workbook(
+        OUTPUT_DIR / file_name, reports, borrowing_lines, tests, issues,
+        run_metadata={
+            "조회 시작연도": begin_year,
+            "조회 종료연도": end_year,
+            "중요성 프리셋": materiality_preset_id,
+            "DART 회사 고유번호": corp.corp_code,
+        },
+    )
 
     judgment_counts = Counter(str(row.get("judgment") or "미분류") for row in tests)
     test_summaries = [
@@ -3802,6 +3803,7 @@ def save_workbook(
     lines: list[BorrowingLine],
     tests: list[dict],
     issues: list[ExtractionIssue] | None = None,
+    run_metadata: dict | None = None,
 ) -> None:
     issues = issues or []
     financial_statement_lines = [line for line in lines if line.source_file == "fnlttSinglAcntAll.json"]
@@ -3986,6 +3988,42 @@ def save_workbook(
         )
     )
 
+    # Keep the compact review sheets intact; preserve evidence separately.
+    trace_headers = [
+        "회사명", "보고서명", "접수일", "접수번호", "원문URL", "원문파일", "줄번호",
+        "키워드", "주석구분", "이자율", "원문검출금액", "금액단위", "적용금액",
+        "추출문맥", "문맥잘림",
+    ]
+    sheets.append((
+        "원문추적", trace_headers,
+        [
+            [
+                line.corp_name, line.report_name, line.receipt_date, line.receipt_no,
+                f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={line.receipt_no}",
+                line.source_file, line.line_no, line.keyword, line.section,
+                format_rates(line.interest_rates), ", ".join(str(amount) for amount in line.amounts),
+                line.amount_unit, line.max_amount, line.context[:32767],
+                "Excel 셀 길이 제한으로 잘림; 원문파일 확인" if len(line.context) > 32767 else "",
+            ]
+            for line in lines
+        ],
+        {7: 2, 13: 2},
+    ))
+    sheets.append((
+        "실행정보", ["항목", "값"],
+        [["프로그램 버전", APP_VERSION], ["생성시각(로컬)", datetime.now().isoformat(timespec="seconds")],
+         ["선택 보고서 수", len(reports)], ["추출 행 수", len(lines)],
+         ["문맥 설명", "추출기가 사용한 문맥이며 원문 파일 전체를 저장한 것은 아닙니다."],
+         *[[key, value] for key, value in (run_metadata or {}).items()]],
+        {},
+    ))
+    sheets.append((
+        "보고서식별", ["회사명", "보고서명", "접수일", "접수번호", "종목코드", "원문URL"],
+        [[r.corp_name, r.report_name, r.receipt_date, r.receipt_no, r.stock_code,
+          f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r.receipt_no}"] for r in reports],
+        {},
+    ))
+
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types(len(sheets)))
         archive.writestr("_rels/.rels", root_rels())
@@ -4004,6 +4042,12 @@ def sheet_xml(
     column_styles = column_styles or {}
     lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
     widths = [16, 28, 12, 16, 14, 18, 14, 18, 16, 16, 16, 12, 16, 16, 16, 16, 16, 16, 16, 16, 14, 16, 34, 12, 80]
+    if "추출문맥" in headers:
+        widths = [16, 28, 12, 20, 60, 28, 12, 20, 26, 20, 32, 14, 20, 100, 42]
+    elif headers == ["항목", "값"]:
+        widths = [26, 100]
+    elif "원문URL" in headers:
+        widths = [16, 28, 12, 20, 14, 60]
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
         for idx, width in enumerate(widths[: max(len(headers), 1)], start=1)
@@ -4466,6 +4510,7 @@ class DartOtApp(tk.Tk):
         root.pack(fill="both", expand=True)
 
         header = tk.Frame(root, bg=OT_DARK, padx=26, pady=15)
+        self.header = header
         header.pack(fill="x")
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, minsize=390)
@@ -4518,6 +4563,7 @@ class DartOtApp(tk.Tk):
         ).pack(anchor="w")
 
         content = tk.Frame(root, bg=OT_BG, padx=22, pady=18)
+        self.content = content
         content.pack(fill="both", expand=True)
         self.setup_page = ttk.Frame(content)
         self.setup_page.pack(fill="both", expand=True)
@@ -4603,6 +4649,7 @@ class DartOtApp(tk.Tk):
         self.result_back_button.pack(side="left")
         self.result_title_var = tk.StringVar(value="검토 결과")
         tk.Label(top, textvariable=self.result_title_var, bg=OT_BG, fg=OT_DARK, font=("맑은 고딕", 19, "bold")).pack(side="left", padx=18)
+        tk.Label(top, text="DART-OT", bg=OT_BG, fg=OT_ACCENT, font=("Segoe UI", 12, "bold")).pack(side="right")
 
         status_card = tk.Frame(self.result_page, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=18, pady=13)
         status_card.pack(fill="x", pady=(0, 12))
@@ -4647,19 +4694,28 @@ class DartOtApp(tk.Tk):
         self.result_tree.tag_configure("review", background="#FFF1E8", foreground="#8A3B12")
         self.result_tree.tag_configure("within", background="#ECF9F5", foreground="#0B6658")
         self.result_tree.grid(row=2, column=0, sticky="nsew")
+        horizontal_scroll = ttk.Scrollbar(detail, orient="horizontal", command=self.result_tree.xview)
+        horizontal_scroll.grid(row=3, column=0, sticky="ew")
+        vertical_scroll = ttk.Scrollbar(detail, orient="vertical", command=self.result_tree.yview)
+        vertical_scroll.grid(row=2, column=1, sticky="ns")
+        self.result_tree.configure(xscrollcommand=horizontal_scroll.set, yscrollcommand=vertical_scroll.set)
 
         result_actions = tk.Frame(self.result_page, bg=OT_BG)
-        result_actions.pack(fill="x", pady=(12, 0))
+        # Reserve footer space before allocating the flexible report table.
+        result_actions.pack(side="bottom", fill="x", pady=(12, 0), before=detail)
         self.result_open_button = tk.Button(result_actions, text="결과 엑셀 열기", command=self.open_output, state="disabled", bg=OT_ACCENT, fg=OT_WHITE, disabledforeground="#B7C7C4", relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9)
         self.result_open_button.pack(side="left")
         tk.Button(result_actions, text="저장 폴더 열기", command=self.open_output_dir, bg=OT_PALE, fg=OT_DARK, relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9).pack(side="left", padx=8)
 
     def _show_result_page(self) -> None:
+        # API inputs are only needed on setup; reserve result space for the table.
+        self.header.pack_forget()
         self.setup_page.pack_forget()
         self.result_page.pack(fill="both", expand=True)
 
     def _show_setup_page(self) -> None:
         self.result_page.pack_forget()
+        self.header.pack(fill="x", before=self.content)
         self.setup_page.pack(fill="both", expand=True)
 
     def _entry(
@@ -4839,7 +4895,7 @@ class DartOtApp(tk.Tk):
             results = client.search_corps(self.get_company_name(), self.stock_var.get())
             self.after(0, lambda: self._show_search_results(results))
         except Exception as exc:
-            self.after(0, lambda: self._show_error(f"회사 검색 중 오류가 발생했습니다: {exc}"))
+            self.after(0, self._show_error, f"회사 검색을 완료하지 못했습니다. {exc}")
 
     def _show_search_results(self, results: list[CorpInfo]) -> None:
         self._set_buttons_state("normal")
@@ -4934,7 +4990,7 @@ class DartOtApp(tk.Tk):
             result = run_report(payload, progress_callback=self._queue_progress)
             self.after(0, lambda: self._show_export_result(result))
         except Exception as exc:
-            self.after(0, lambda: self._show_error(f"실행 중 오류가 발생했습니다: {exc}"))
+            self.after(0, self._show_error, f"검토를 완료하지 못했습니다. {exc}")
 
     def _queue_progress(self, percent: int, message: str) -> None:
         self.after(0, self._apply_progress, percent, message)
@@ -4957,6 +5013,8 @@ class DartOtApp(tk.Tk):
     def _show_export_result(self, result: dict) -> None:
         self._set_buttons_state("normal")
         self.result_back_button.configure(state="normal")
+        self.result_open_button.configure(state="disabled", cursor="")
+        self.output_file = None
         self.status_var.set(result.get("message", "작업이 완료되었습니다."))
         self.summary_var.set(
             f"정기보고서: {result.get('reportCount', 0)}    "
@@ -4984,7 +5042,8 @@ class DartOtApp(tk.Tk):
             f"분석기간  {result.get('beginYear', '-')}~{result.get('endYear', '-')}    |    "
             f"적용 기준  {result.get('materialityPresetLabel', '-')}    |    "
             f"차입금 관련 문맥  {result.get('noteCount', 0)}건\n"
-            "금액 단위는 백만원입니다. '추가 확인 필요' 또는 '주의요망' 행을 우선 확인하세요."
+            "금액 단위는 백만원입니다. '추가 확인 필요' 또는 '주의요망' 행을 우선 확인하세요.\n"
+            "엑셀의 '원문추적' 시트에서 접수번호와 추출 문맥을 확인할 수 있습니다."
         )
         for row in result.get("testSummaries", []):
             judgment = str(row.get("judgment") or "-")
@@ -5007,9 +5066,17 @@ class DartOtApp(tk.Tk):
     def _show_error(self, message: str) -> None:
         self._set_buttons_state("normal")
         self.result_back_button.configure(state="normal")
+        self.result_open_button.configure(state="disabled", cursor="")
+        self.output_file = None
+        self.result_title_var.set("작업을 완료하지 못했습니다")
+        self.result_progress.configure(value=0)
+        for value_var in self.result_metric_vars.values():
+            value_var.set("-")
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
         self.status_var.set(message)
         self._show_result_page()
-        self.result_status_var.set("오류 · 입력 또는 공시 추출 결과를 확인하세요")
+        self.result_status_var.set("입력으로 돌아가 안내에 따라 다시 실행해 주세요")
         self.result_summary_var.set(message)
 
     def _set_buttons_state(self, state: str) -> None:
