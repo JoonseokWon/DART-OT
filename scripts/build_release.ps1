@@ -95,6 +95,7 @@ foreach ($Target in $Targets) {
 
 Copy-Item -LiteralPath (Join-Path $Root "README.md") -Destination $PackageRoot
 Copy-Item -LiteralPath (Join-Path $Root "프로세스.md") -Destination $PackageRoot
+Copy-Item -LiteralPath (Join-Path $Root "docs") -Destination $PackageRoot -Recurse
 Set-Content -LiteralPath (Join-Path $PackageRoot "VERSION.txt") -Value $Version -Encoding UTF8
 
 Compress-Archive -LiteralPath $PackageRoot -DestinationPath $ZipPath -CompressionLevel Optimal
