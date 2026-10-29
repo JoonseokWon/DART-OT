@@ -36,7 +36,7 @@ def runtime_root() -> Path:
 
 
 ROOT = runtime_root()
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"

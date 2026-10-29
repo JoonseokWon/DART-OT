@@ -115,7 +115,8 @@ if __name__ == "__main__":
                     assert button.winfo_rooty() + button.winfo_height() <= window.winfo_rooty() + window.winfo_height()
                 checks.append("최소 창 크기에서 주요 버튼 노출")
                 checks.append("결과 표의 제목과 데이터 행 노출")
-                print(json.dumps({"ok": True, "checks": checks}, ensure_ascii=False), flush=True)
+                # JSON escapes keep CI logs readable on non-Korean Windows consoles.
+                print(json.dumps({"ok": True, "checks": checks}), flush=True)
                 if "--preview-result" in sys.argv:
                     window.title("DART-OT · 결과 화면 검증 (모의 데이터)")
                 else:

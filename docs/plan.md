@@ -7,6 +7,6 @@
 | 3 | 원문 추적 보존 | app.py Excel 출력 | 기존 시트·스타일 확인 | ZIP 내부 셀과 식별키 대조 |
 | 4 | 오류 복귀·성공 안내 | Tk 작업 콜백과 결과 문구 | docs/design.md | 지연 콜백 자동 테스트·실제 화면 |
 | 5 | 배포 회귀 검사 | tests, Actions | 2~4 완료 | unittest, 문법 검사, diff 검토 |
-| 6 | 커밋·릴리스·인계 | docs, Git 태그 | 검증 완료 | v0.1.1 Actions와 ZIP·SHA256 확인 |
+| 6 | 커밋·릴리스·인계 | docs, Git 태그 | 검증 완료 | v0.1.2 Actions와 ZIP·SHA256 확인 |
 
 모든 지원 파일과 생성 결과는 프로젝트 안에 보관한다. 각 단계의 실행 결과와 미확인 항목은 todo와 handoff에 갱신한다.
