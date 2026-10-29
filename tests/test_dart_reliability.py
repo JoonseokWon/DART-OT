@@ -183,6 +183,14 @@ class ExportEvidenceTests(unittest.TestCase):
 
 
 class DelayedUIErrorTests(unittest.TestCase):
+    def test_combined_company_field_routes_six_digit_stock_codes(self):
+        fake = SimpleNamespace(get_company_name=Mock(return_value="005930"), stock_var=Mock(),
+                               after=Mock(), _show_search_results=Mock(), _show_error=Mock())
+        with patch("app.DartClient") as cls:
+            cls.return_value.search_corps.return_value = []
+            app.DartOtApp._search_company_worker(fake, "test")
+            cls.return_value.search_corps.assert_called_once_with("", "005930")
+
     def test_error_survives_exception_scope_for_both_workers(self):
         for method in (app.DartOtApp._search_company_worker, app.DartOtApp._run_export_worker):
             callbacks = []

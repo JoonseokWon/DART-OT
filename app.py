@@ -27,6 +27,7 @@ import tkinter.font as tkfont
 from xml.etree import ElementTree
 
 from dart_api import check_dart_status, get_dart_bytes, parse_dart_json, read_dart_xml_files
+import desktop_ui
 
 
 def runtime_root() -> Path:
@@ -36,21 +37,21 @@ def runtime_root() -> Path:
 
 
 ROOT = runtime_root()
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.2.0"
 BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 OUTPUT_DIR = ROOT / "outputs"
 CONFIG_PATH = ROOT / ".dart_ot_config.json"
 UI_DEBUG_PATH = OUTPUT_DIR / "ui_debug.log"
 SOURCE_RELOAD_INTERVAL_MS = 800
-OT_DARK = "#052D2B"
-OT_DARK_2 = "#0A4440"
-OT_ACCENT = "#16A58F"
-OT_MINT = "#5EEAD4"
-OT_PALE = "#E8F7F4"
-OT_BG = "#F2F7F6"
-OT_INK = "#15312E"
-OT_MUTED = "#647976"
-OT_LINE = "#CFE0DD"
+OT_DARK = desktop_ui.INK
+OT_DARK_2 = desktop_ui.TEXT
+OT_ACCENT = desktop_ui.BLUE
+OT_MINT = desktop_ui.BLUE_PALE
+OT_PALE = desktop_ui.BLUE_PALE
+OT_BG = desktop_ui.BG
+OT_INK = desktop_ui.INK
+OT_MUTED = desktop_ui.MUTED
+OT_LINE = desktop_ui.LINE
 OT_WHITE = "#FFFFFF"
 BORROWING_KEYWORDS = ["차입금", "사채", "금융부채", "이자율", "이율", "금리", "가중평균", "담보제공", "이자비용", "금융원가"]
 DISPLAY_KEYWORDS = [
@@ -4255,12 +4256,18 @@ class NativeWindowsEntry:
         *,
         show: str | None = None,
         on_change=None,
+        on_submit=None,
+        placeholder: str = "",
     ) -> None:
         self.variable = variable
         self.on_change = on_change
+        self.on_submit = on_submit
+        self._enter_down = False
+        self._has_focus = False
         self._destroyed = False
         self._last_value = variable.get()
-        self.container = tk.Frame(parent, background="#ffffff", height=max(30, round(30 * scale)))
+        self.container = tk.Canvas(parent, background="#ffffff", width=1, height=max(40, round(32 * scale)), highlightthickness=0, bd=0)
+        self.control_height = max(28, round(25 * scale))
         self.container.pack(fill="x")
         self.container.pack_propagate(False)
         self.container.update_idletasks()
@@ -4285,6 +4292,10 @@ class NativeWindowsEntry:
         user32.CreateWindowExW.restype = wintypes.HWND
         user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
         user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetFocus.argtypes = ()
+        user32.GetFocus.restype = wintypes.HWND
+        user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+        user32.GetAsyncKeyState.restype = ctypes.c_short
         user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
         user32.GetWindowTextW.restype = ctypes.c_int
         user32.SetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPCWSTR)
@@ -4314,7 +4325,7 @@ class NativeWindowsEntry:
         gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
         gdi32.DeleteObject.restype = wintypes.BOOL
 
-        styles = self.WS_CHILD | self.WS_VISIBLE | self.WS_TABSTOP | self.WS_BORDER | self.ES_AUTOHSCROLL
+        styles = self.WS_CHILD | self.WS_VISIBLE | self.WS_TABSTOP | self.ES_AUTOHSCROLL
         self.hwnd = user32.CreateWindowExW(
             0,
             "EDIT",
@@ -4332,7 +4343,7 @@ class NativeWindowsEntry:
         if not self.hwnd:
             raise ctypes.WinError()
 
-        font_height = -max(15, round(14 * scale))
+        font_height = -max(16, round(16 * scale))
         self.font_handle = gdi32.CreateFontW(
             font_height,
             0,
@@ -4353,6 +4364,10 @@ class NativeWindowsEntry:
             user32.SendMessageW(self.hwnd, self.WM_SETFONT, self.font_handle, 1)
         if show:
             user32.SendMessageW(self.hwnd, self.EM_SETPASSWORDCHAR, ord(show[0]), 0)
+        if placeholder:
+            cue_text = ctypes.create_unicode_buffer(placeholder)
+            user32.SendMessageW(self.hwnd, 0x1501, 0, ctypes.cast(cue_text, ctypes.c_void_p).value)
+
 
         self.container.bind("<Configure>", self._resize, add="+")
         self.container.bind("<Destroy>", self._destroy, add="+")
@@ -4361,12 +4376,18 @@ class NativeWindowsEntry:
     def _resize(self, _event: tk.Event | None = None) -> None:
         if self._destroyed or not ctypes.windll.user32.IsWindow(self.hwnd):
             return
+        width, height = self.container.winfo_width(), self.container.winfo_height()
+        self.container.delete("all")
+        if width > 2 and height > 2:
+            desktop_ui.rounded_shape(self.container, 1, 1, width - 1, height - 1, 12,
+                                     fill="#FFFFFF", outline=desktop_ui.BLUE if self._has_focus else "#D1D6DB", width=2 if self._has_focus else 1)
+        control_height = min(height, self.control_height)
         ctypes.windll.user32.MoveWindow(
             self.hwnd,
-            0,
-            0,
-            max(1, self.container.winfo_width()),
-            max(1, self.container.winfo_height()),
+            12,
+            max(0, (height - control_height) // 2),
+            max(1, width - 24),
+            max(1, control_height),
             True,
         )
 
@@ -4396,7 +4417,18 @@ class NativeWindowsEntry:
         if self._destroyed:
             return
         self.sync()
-        self.container.after(80, self._poll)
+        focused = ctypes.windll.user32.GetFocus() == self.hwnd
+        if focused != self._has_focus:
+            self._has_focus = focused
+            self._resize()
+        if self.on_submit is not None and focused:
+            key_state = ctypes.windll.user32.GetAsyncKeyState(13)
+            if key_state & 0x8001 and not self._enter_down:
+                self.on_submit()
+            self._enter_down = bool(key_state & 0x8000)
+        else:
+            self._enter_down = False
+        self.container.after(40, self._poll)
 
     def winfo_class(self) -> str:
         return "Edit"
@@ -4477,235 +4509,11 @@ class DartOtApp(tk.Tk):
             pass
 
     def _build(self) -> None:
-        self.configure(bg=OT_BG)
-        for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
-            try:
-                tkfont.nametofont(font_name).configure(family="맑은 고딕", size=12)
-            except tk.TclError:
-                pass
-        style = ttk.Style(self)
-        style.configure("TFrame", background=OT_BG)
-        style.configure("Panel.TFrame", background=OT_WHITE)
-        style.configure("API.TFrame", background=OT_DARK_2)
-        style.configure("TLabel", background=OT_BG, foreground=OT_INK, font=("맑은 고딕", 12))
-        style.configure("Panel.TLabel", background=OT_WHITE, foreground=OT_INK, font=("맑은 고딕", 12))
-        style.configure("API.TLabel", background=OT_DARK_2, foreground="#D8EFEB", font=("맑은 고딕", 12))
-        style.configure("Title.TLabel", background=OT_DARK, foreground=OT_WHITE, font=("맑은 고딕", 22, "bold"))
-        style.configure("TButton", font=("맑은 고딕", 12), padding=(8, 6))
-        style.configure("Accent.TButton", font=("맑은 고딕", 12, "bold"), padding=(8, 8), foreground=OT_DARK)
-        style.configure("TCheckbutton", background=OT_WHITE, font=("맑은 고딕", 12))
-        style.configure("API.TCheckbutton", background=OT_DARK_2, foreground="#D8EFEB", font=("맑은 고딕", 12))
-        style.map(
-            "API.TCheckbutton",
-            background=[("active", OT_DARK_2)],
-            foreground=[("active", OT_WHITE), ("disabled", "#779C97")],
-        )
-        style.configure("Input.TEntry", font=self.entry_font, padding=(6, 4))
-        style.configure("TCombobox", font=("맑은 고딕", 11), padding=(5, 3))
-        style.configure("Treeview", font=("맑은 고딕", 11), rowheight=30)
-        style.configure("Treeview.Heading", font=("맑은 고딕", 11, "bold"))
-        style.configure("OT.Horizontal.TProgressbar", troughcolor=OT_PALE, background=OT_ACCENT, bordercolor=OT_PALE, thickness=10)
-
-        root = tk.Frame(self, bg=OT_BG)
-        root.pack(fill="both", expand=True)
-
-        header = tk.Frame(root, bg=OT_DARK, padx=26, pady=15)
-        self.header = header
-        header.pack(fill="x")
-        header.columnconfigure(0, weight=1)
-        header.columnconfigure(1, minsize=390)
-
-        title_block = tk.Frame(header, bg=OT_DARK)
-        title_block.grid(row=0, column=0, sticky="nw", padx=(0, 24))
-        brand_line = tk.Frame(title_block, bg=OT_DARK)
-        brand_line.pack(anchor="w")
-        header_icon_path = BUNDLE_ROOT / "assets" / "DART-OT.png"
-        if header_icon_path.exists():
-            try:
-                self._header_icon_image = tk.PhotoImage(file=header_icon_path).subsample(16, 16)
-                tk.Label(
-                    brand_line,
-                    image=self._header_icon_image,
-                    bg=OT_DARK,
-                    borderwidth=0,
-                ).pack(side="left", padx=(0, 14))
-            except tk.TclError:
-                pass
-        brand_text = tk.Frame(brand_line, bg=OT_DARK)
-        brand_text.pack(side="left")
-        ttk.Label(brand_text, text="DART-OT", style="Title.TLabel").pack(anchor="w")
-        tk.Label(brand_text, text="이자비용 오버롤 테스트", bg=OT_DARK, fg="#C9E6E1", font=("맑은 고딕", 10)).pack(anchor="w")
-        description_line = tk.Frame(title_block, bg=OT_DARK)
-        description_line.pack(anchor="w", pady=(5, 0))
-        tk.Label(
-            description_line,
-            text="DART 공시에서 차입금·이자율·실제 이자비용을 연결해 검토합니다.",
-            bg=OT_DARK,
-            fg="#A9CAC5",
-            font=("맑은 고딕", 9),
-        ).pack(side="left")
-        tk.Label(
-            description_line,
-            text="  ·  BY JOONSEOK WON",
-            bg=OT_DARK,
-            fg=OT_MINT,
-            font=("Segoe UI", 8, "bold"),
-        ).pack(side="left")
-
-        api_panel = ttk.Frame(header, style="API.TFrame", padding=(14, 8))
-        api_panel.grid(row=0, column=1, sticky="new")
-        self._entry(api_panel, "DART API 키", self.api_key_var, show="*", surface="API")
-        ttk.Checkbutton(
-            api_panel,
-            text="API 키 저장",
-            variable=self.save_api_key_var,
-            style="API.TCheckbutton",
-        ).pack(anchor="w")
-
-        content = tk.Frame(root, bg=OT_BG, padx=22, pady=18)
-        self.content = content
-        content.pack(fill="both", expand=True)
-        self.setup_page = ttk.Frame(content)
-        self.setup_page.pack(fill="both", expand=True)
-
-        body = ttk.Frame(self.setup_page)
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=0)
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
-
-        left = ttk.Frame(body, style="Panel.TFrame", padding=20)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 18))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-        right = ttk.Frame(body, style="Panel.TFrame", padding=20)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
-
-        fields = ttk.Frame(left, style="Panel.TFrame", width=340)
-        fields.grid(row=0, column=0, sticky="new")
-        self._company_entry(fields)
-        self._entry(fields, "종목코드", self.stock_var)
-        self._entry(fields, "DART 고유번호", self.corp_code_var)
-
-        year_frame = ttk.Frame(fields, style="Panel.TFrame")
-        year_frame.pack(fill="x", pady=(2, 0))
-        year_frame.columnconfigure(0, weight=1)
-        year_frame.columnconfigure(1, weight=1)
-        self._entry(year_frame, "시작연도", self.begin_year_var, width=12, grid_col=0)
-        self._entry(year_frame, "종료연도", self.end_year_var, width=12, grid_col=1)
-
-        preset_frame = ttk.Frame(fields, style="Panel.TFrame")
-        preset_frame.pack(fill="x", pady=(2, 0))
-        ttk.Label(preset_frame, text="중요성 프리셋", style="Panel.TLabel").pack(anchor="w", pady=(0, 2))
-        preset_combo = ttk.Combobox(
-            preset_frame,
-            state="readonly",
-            textvariable=self.materiality_preset_display_var,
-            values=[preset.label for preset in MATERIALITY_PRESETS.values()],
-            width=28,
-        )
-        preset_combo.pack(fill="x")
-        preset_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_materiality_preset())
-
-        actions = ttk.Frame(left, style="Panel.TFrame")
-        actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.search_button = ttk.Button(actions, text="회사 검색", command=self.search_company, style="Accent.TButton")
-        self.search_button.pack(fill="x", pady=(0, 8))
-        self.export_button = ttk.Button(actions, text="검토 실행 및 결과 생성", command=self.run_export, style="Accent.TButton")
-        self.export_button.pack(fill="x")
-
-        ttk.Label(right, text="회사 선택", style="Panel.TLabel", font=("맑은 고딕", 14, "bold")).grid(row=0, column=0, sticky="w")
-        columns = ("corp_name", "stock_code", "corp_code")
-        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=14)
-        self.tree.heading("corp_name", text="회사명")
-        self.tree.heading("stock_code", text="종목코드")
-        self.tree.heading("corp_code", text="DART 고유번호")
-        self.tree.column("corp_name", width=430)
-        self.tree.column("stock_code", width=140, anchor="center")
-        self.tree.column("corp_code", width=170, anchor="center")
-        self.tree.grid(row=1, column=0, sticky="nsew", pady=(10, 12))
-        self.tree.bind("<<TreeviewSelect>>", self.select_company)
-
-        status = ttk.Label(right, textvariable=self.status_var, style="Panel.TLabel", wraplength=820, justify="left")
-        status.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(right, textvariable=self.summary_var, style="Panel.TLabel").grid(row=3, column=0, sticky="w")
-
-        buttons = ttk.Frame(right, style="Panel.TFrame")
-        buttons.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-        ttk.Button(buttons, text="결과 파일 열기", command=self.open_output).pack(side="left")
-        ttk.Button(buttons, text="저장 폴더 열기", command=self.open_output_dir).pack(side="left", padx=(8, 0))
-        self._build_result_page(content)
+        self.preset_labels = [preset.label for preset in MATERIALITY_PRESETS.values()]
+        desktop_ui.build_workspace(self)
 
     def _build_result_page(self, parent: tk.Widget) -> None:
-        self.result_page = tk.Frame(parent, bg=OT_BG)
-        top = tk.Frame(self.result_page, bg=OT_BG)
-        top.pack(fill="x", pady=(0, 12))
-        self.result_back_button = tk.Button(
-            top, text="← 조건 및 회사 선택", command=self._show_setup_page,
-            bg=OT_PALE, fg=OT_DARK, relief="flat", font=("맑은 고딕", 10, "bold"), padx=14, pady=7,
-        )
-        self.result_back_button.pack(side="left")
-        self.result_title_var = tk.StringVar(value="검토 결과")
-        tk.Label(top, textvariable=self.result_title_var, bg=OT_BG, fg=OT_DARK, font=("맑은 고딕", 19, "bold")).pack(side="left", padx=18)
-        tk.Label(top, text="DART-OT", bg=OT_BG, fg=OT_ACCENT, font=("Segoe UI", 12, "bold")).pack(side="right")
-
-        status_card = tk.Frame(self.result_page, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=18, pady=13)
-        status_card.pack(fill="x", pady=(0, 12))
-        self.result_status_var = tk.StringVar(value="검토를 준비하고 있습니다.")
-        tk.Label(status_card, textvariable=self.result_status_var, bg=OT_WHITE, fg=OT_ACCENT, font=("맑은 고딕", 10, "bold"), anchor="w").pack(fill="x")
-        self.result_progress = ttk.Progressbar(status_card, style="OT.Horizontal.TProgressbar", mode="determinate", maximum=100, value=0)
-        self.result_progress.pack(fill="x", pady=(9, 0))
-
-        metrics = tk.Frame(self.result_page, bg=OT_BG)
-        metrics.pack(fill="x", pady=(0, 12))
-        self.result_metric_vars: dict[str, tk.StringVar] = {}
-        for column, (key, label) in enumerate((("reports", "정기보고서"), ("tests", "연도별 테스트"), ("within", "기준 이내"), ("review", "추가 확인"), ("issues", "추출 이슈"))):
-            metrics.grid_columnconfigure(column, weight=1, uniform="metric")
-            card = tk.Frame(metrics, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=13, pady=10)
-            card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 5, 0 if column == 4 else 5))
-            value_var = tk.StringVar(value="-")
-            self.result_metric_vars[key] = value_var
-            tk.Label(card, text=label, bg=OT_WHITE, fg=OT_MUTED, font=("맑은 고딕", 9)).pack(anchor="w")
-            tk.Label(card, textvariable=value_var, bg=OT_WHITE, fg=OT_DARK, font=("Segoe UI", 18, "bold")).pack(anchor="w")
-
-        detail = tk.Frame(self.result_page, bg=OT_WHITE, highlightbackground=OT_LINE, highlightthickness=1, padx=16, pady=14)
-        detail.pack(fill="both", expand=True)
-        detail.grid_columnconfigure(0, weight=1)
-        detail.grid_rowconfigure(2, weight=1)
-        self.result_summary_var = tk.StringVar(value="분석을 실행하면 회사와 적용 기준 요약이 표시됩니다.")
-        tk.Label(detail, text="즉시 확인 요약", bg=OT_WHITE, fg=OT_DARK, font=("맑은 고딕", 13, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(detail, textvariable=self.result_summary_var, bg=OT_WHITE, fg=OT_INK, font=("맑은 고딕", 10), anchor="w", justify="left", wraplength=1050).grid(row=1, column=0, sticky="ew", pady=(5, 12))
-        columns = ("report", "judgment", "expected", "actual", "difference", "threshold", "caution", "caution_reason")
-        self.result_tree = ttk.Treeview(detail, columns=columns, show="headings", height=8)
-        for key, label, width in (
-            ("report", "보고서", 175),
-            ("judgment", "판정", 105),
-            ("expected", "계산 이자", 90),
-            ("actual", "실제 이자", 90),
-            ("difference", "차이", 90),
-            ("threshold", "허용차이", 90),
-            ("caution", "주의", 80),
-            ("caution_reason", "주의요망 사유", 280),
-        ):
-            self.result_tree.heading(key, text=label)
-            self.result_tree.column(key, width=width, anchor="w" if key in ("report", "caution_reason") else "center")
-        self.result_tree.tag_configure("review", background="#FFF1E8", foreground="#8A3B12")
-        self.result_tree.tag_configure("within", background="#ECF9F5", foreground="#0B6658")
-        self.result_tree.grid(row=2, column=0, sticky="nsew")
-        horizontal_scroll = ttk.Scrollbar(detail, orient="horizontal", command=self.result_tree.xview)
-        horizontal_scroll.grid(row=3, column=0, sticky="ew")
-        vertical_scroll = ttk.Scrollbar(detail, orient="vertical", command=self.result_tree.yview)
-        vertical_scroll.grid(row=2, column=1, sticky="ns")
-        self.result_tree.configure(xscrollcommand=horizontal_scroll.set, yscrollcommand=vertical_scroll.set)
-
-        result_actions = tk.Frame(self.result_page, bg=OT_BG)
-        # Reserve footer space before allocating the flexible report table.
-        result_actions.pack(side="bottom", fill="x", pady=(12, 0), before=detail)
-        self.result_open_button = tk.Button(result_actions, text="결과 엑셀 열기", command=self.open_output, state="disabled", bg=OT_ACCENT, fg=OT_WHITE, disabledforeground="#B7C7C4", relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9)
-        self.result_open_button.pack(side="left")
-        tk.Button(result_actions, text="저장 폴더 열기", command=self.open_output_dir, bg=OT_PALE, fg=OT_DARK, relief="flat", font=("맑은 고딕", 10, "bold"), padx=18, pady=9).pack(side="left", padx=8)
+        desktop_ui.build_results(self, parent)
 
     def _show_result_page(self) -> None:
         # API inputs are only needed on setup; reserve result space for the table.
@@ -4750,13 +4558,15 @@ class DartOtApp(tk.Tk):
     def _company_entry(self, parent) -> None:
         container = ttk.Frame(parent, style="Panel.TFrame")
         container.pack(fill="x", pady=(0, 6))
-        ttk.Label(container, text="회사명", style="Panel.TLabel").pack(anchor="w", pady=(0, 2))
+        ttk.Label(container, text="회사명 또는 종목코드", style="Panel.TLabel").pack(anchor="w", pady=(0, 8))
         if sys.platform == "win32":
             self.company_entry = NativeWindowsEntry(
                 container,
                 self.company_var,
                 self.ui_scale,
                 on_change=self.log_company_entry_state,
+                on_submit=self.search_company,
+                placeholder="예) 삼성전자, 005930",
             )
             self.native_entries.append(self.company_entry)
             self.log_company_entry_state()
@@ -4892,7 +4702,8 @@ class DartOtApp(tk.Tk):
     def _search_company_worker(self, api_key: str) -> None:
         try:
             client = DartClient(api_key)
-            results = client.search_corps(self.get_company_name(), self.stock_var.get())
+            query = self.get_company_name()
+            results = client.search_corps("", query) if re.fullmatch(r"\d{6}", query) else client.search_corps(query, self.stock_var.get())
             self.after(0, lambda: self._show_search_results(results))
         except Exception as exc:
             self.after(0, self._show_error, f"회사 검색을 완료하지 못했습니다. {exc}")
@@ -4907,12 +4718,21 @@ class DartOtApp(tk.Tk):
             self.tree.insert("", "end", iid=str(idx), values=(corp.corp_name, corp.stock_code, corp.corp_code))
 
         if results:
+            self.empty_state.pack_forget()
+            self.tree.pack(fill="both", expand=True)
+        else:
+            self.tree.pack_forget()
+            self.empty_title_var.set("검색 결과가 없어요")
+            self.empty_state.pack(fill="both", expand=True)
+
+        if results:
             self.tree.selection_set("0")
             self.tree.focus("0")
             self.select_company()
-            self.status_var.set(f"검색 결과 {len(results)}건이 있습니다. 정확한 회사를 선택한 뒤 엑셀 파일 생성을 눌러 주세요.")
+            self.status_var.set(f"검색 결과 {len(results)}곳 · 선택한 회사의 검토를 시작해 주세요.")
         else:
             self.status_var.set("검색 결과가 없습니다. 회사명 또는 종목코드를 다시 확인해 주세요.")
+        self.export_button.configure(state="normal" if results else "disabled")
 
     def select_company(self, _event=None) -> None:
         selected = self.tree.selection()
@@ -5039,11 +4859,9 @@ class DartOtApp(tk.Tk):
         self.result_progress.configure(value=100)
         self.result_title_var.set(f"{result.get('companyName', '-')} · 이자비용 검토 결과")
         self.result_summary_var.set(
-            f"분석기간  {result.get('beginYear', '-')}~{result.get('endYear', '-')}    |    "
-            f"적용 기준  {result.get('materialityPresetLabel', '-')}    |    "
-            f"차입금 관련 문맥  {result.get('noteCount', 0)}건\n"
-            "금액 단위는 백만원입니다. '추가 확인 필요' 또는 '주의요망' 행을 우선 확인하세요.\n"
-            "엑셀의 '원문추적' 시트에서 접수번호와 추출 문맥을 확인할 수 있습니다."
+            f"조회 {result.get('beginYear', '-')}~{result.get('endYear', '-')}  ·  "
+            f"{result.get('materialityPresetLabel', '-')}  ·  단위: 백만원\n"
+            "추가 확인·주의요망 행을 먼저 검토하세요. 근거는 엑셀 '원문추적' 시트에서 확인할 수 있어요."
         )
         for row in result.get("testSummaries", []):
             judgment = str(row.get("judgment") or "-")
@@ -5084,7 +4902,7 @@ class DartOtApp(tk.Tk):
             self._set_state_recursive(child, state)
 
     def _set_state_recursive(self, widget, state: str) -> None:
-        if isinstance(widget, ttk.Button):
+        if isinstance(widget, (ttk.Button, desktop_ui.Button)):
             widget.configure(state=state)
         for child in widget.winfo_children():
             self._set_state_recursive(child, state)

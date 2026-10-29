@@ -87,14 +87,22 @@ if __name__ == "__main__":
                 assert str(window.result_open_button.cget("state")) == "disabled"
                 checks.append("오류 안내와 입력 보존")
                 window._show_setup_page()
+                window.update_idletasks()
+                assert window.companies_card.winfo_rootx() + window.companies_card.winfo_width() <= window.winfo_rootx() + window.winfo_width()
+                assert window.preset_combo.winfo_ismapped(), (window.winfo_geometry(), window.conditions_card.winfo_geometry(), window.conditions_card.body.winfo_geometry(), window.conditions_card.body.winfo_reqheight())
+                assert window.preset_combo.winfo_rooty() + window.preset_combo.winfo_height() <= window.conditions_card.winfo_rooty() + window.conditions_card.winfo_height()
                 window.set_company_name("검증회사")
                 window.search_company()
                 wait_until(lambda: window.selected_corp is not None, check_search)
 
             def check_search():
                 assert window.selected_corp.corp_name == "검증회사"
+                assert window.export_button.cget("state") == "normal"
+                window.update_idletasks()
+                assert window.export_button.winfo_ismapped()
+                assert window.export_button.winfo_rooty() + window.export_button.winfo_height() <= window.companies_card.winfo_rooty() + window.companies_card.winfo_height()
                 checks.append("오류 후 회사 재검색")
-                window.run_export()
+                window.export_button.invoke()
                 wait_until(lambda: window.output_file is not None, check_export)
 
             def check_export():
@@ -131,6 +139,7 @@ if __name__ == "__main__":
 
             window.report_callback_exception = report_test_error
             window.set_company_name("오류검증")
+            window.geometry("1180x760")
             window.after(300, window.search_company)
             window.after(400, wait_until, lambda: "입력으로 돌아가" in window.result_status_var.get(), check_error)
         window.mainloop()
